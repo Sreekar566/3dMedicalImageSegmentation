@@ -166,3 +166,73 @@ def test_config_orientation_validator() -> None:
 
     with pytest.raises(ValueError):
         InferenceSettings(target_orientation="XYZ")
+
+
+def test_direction_matrix_physical_centroid_calculation() -> None:
+    """Validate that physical centroid coordinates correctly apply the 3D direction cosine matrix."""
+    arr = np.zeros((20, 30, 40), dtype=np.float32)
+    img = sitk.GetImageFromArray(arr)
+    img.SetSpacing((1.5, 2.0, 2.5))
+    img.SetOrigin((100.0, -50.0, 20.0))
+
+    img_ras = sitk.DICOMOrient(img, "RAS")
+
+    metadata = VolumetricMetadata(
+        dimensions=img_ras.GetSize(),
+        spacing=img_ras.GetSpacing(),
+        origin=img_ras.GetOrigin(),
+        direction=img_ras.GetDirection(),
+        spatial_orientation="RAS",
+    )
+
+    # SimpleITK GetArrayFromImage returns (Z, Y, X)
+    raw_array = sitk.GetArrayFromImage(img_ras)
+    mask_array = np.zeros_like(raw_array, dtype=np.uint8)
+
+    # Set a 4x6x8 region as label 1
+    # Z indices: 5..8 (mean = 6.5)
+    # Y indices: 10..15 (mean = 12.5)
+    # X indices: 20..27 (mean = 23.5)
+    mask_array[5:9, 10:16, 20:28] = 1
+
+    settings = InferenceSettings(roi_size=(16, 16, 16), device="cpu")
+    model = build_3d_unet(in_channels=1, out_channels=2, channels=(8, 16), strides=(2,), num_res_units=1)
+    inferer = SlidingWindowInferenceEngine(model=model, settings=settings)
+
+    summary, slice_gen = inferer.compute_metrics(
+        raw_array=raw_array,
+        mask_array=mask_array,
+        metadata=metadata,
+        duration_seconds=0.5,
+    )
+
+    assert len(summary.labels) == 1
+    label = summary.labels[0]
+
+    # Expected centroid continuous index (X, Y, Z)
+    expected_cx = 23.5
+    expected_cy = 12.5
+    expected_cz = 6.5
+    expected_physical = img_ras.TransformContinuousIndexToPhysicalPoint((expected_cx, expected_cy, expected_cz))
+
+    assert np.allclose(label.centroid_mm, expected_physical, atol=1e-4)
+
+
+def test_compute_metrics_shape_mismatch_raises_value_error() -> None:
+    """Verify that compute_metrics raises ValueError on mismatched raw and mask shapes."""
+    settings = InferenceSettings(roi_size=(16, 16, 16), device="cpu")
+    model = build_3d_unet(in_channels=1, out_channels=2, channels=(8, 16), strides=(2,), num_res_units=1)
+    inferer = SlidingWindowInferenceEngine(model=model, settings=settings)
+
+    raw_array = np.zeros((24, 24, 24), dtype=np.float32)
+    mask_array = np.zeros((16, 16, 16), dtype=np.uint8)
+    metadata = VolumetricMetadata(dimensions=(24, 24, 24), spacing=(1.0, 1.0, 1.0))
+
+    with pytest.raises(ValueError, match="Array shape mismatch"):
+        inferer.compute_metrics(
+            raw_array=raw_array,
+            mask_array=mask_array,
+            metadata=metadata,
+            duration_seconds=0.1,
+        )
+

@@ -126,6 +126,12 @@ class SlidingWindowInferenceEngine:
         """
         logger.info("Extracting quantitative volumetric metrics...")
 
+        if raw_array.shape != mask_array.shape:
+            raise ValueError(
+                f"Array shape mismatch: raw_array shape {raw_array.shape} "
+                f"does not match mask_array shape {mask_array.shape}."
+            )
+
         dx, dy, dz = metadata.spacing
         voxel_volume_mm3 = dx * dy * dz
         pixel_area_axial_mm2 = dx * dy
@@ -153,11 +159,19 @@ class SlidingWindowInferenceEngine:
             cz, cy, cx = np.mean(z_indices), np.mean(y_indices), np.mean(x_indices)
 
             ox, oy, oz = metadata.origin
-            centroid_mm = (
-                float(ox + cx * dx),
-                float(oy + cy * dy),
-                float(oz + cz * dz),
-            )
+            if len(metadata.direction) == 9:
+                d = metadata.direction
+                # SimpleITK continuous index (cx, cy, cz) to physical point in patient space
+                px = ox + d[0] * (cx * dx) + d[1] * (cy * dy) + d[2] * (cz * dz)
+                py = oy + d[3] * (cx * dx) + d[4] * (cy * dy) + d[5] * (cz * dz)
+                pz = oz + d[6] * (cx * dx) + d[7] * (cy * dy) + d[8] * (cz * dz)
+                centroid_mm = (float(px), float(py), float(pz))
+            else:
+                centroid_mm = (
+                    float(ox + cx * dx),
+                    float(oy + cy * dy),
+                    float(oz + cz * dz),
+                )
 
             bbox = (
                 int(np.min(x_indices)),
@@ -221,6 +235,8 @@ class SlidingWindowInferenceEngine:
         depth, height, width = mask_array.shape
         ox, oy, oz = metadata.origin
         dx, dy, dz = metadata.spacing
+        has_direction = len(metadata.direction) == 9
+        d = metadata.direction if has_direction else ()
 
         for lbl in unique_labels:
             for z in range(depth):
@@ -231,7 +247,10 @@ class SlidingWindowInferenceEngine:
 
                 slice_intensities = raw_array[z, :, :][slice_mask]
                 area_mm2 = float(slice_count * pixel_area_axial_mm2)
-                pos_z_mm = float(oz + z * dz)
+                if has_direction:
+                    pos_z_mm = float(oz + d[6] * 0.0 + d[7] * 0.0 + d[8] * (z * dz))
+                else:
+                    pos_z_mm = float(oz + z * dz)
 
                 yield {
                     "label_id": lbl,

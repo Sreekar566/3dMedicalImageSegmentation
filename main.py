@@ -10,8 +10,15 @@ import argparse
 import logging
 import sys
 import time
+import types
 from pathlib import Path
 from typing import Optional
+
+# Ensure 'medical_segmentation' module namespace is resolvable
+if "medical_segmentation" not in sys.modules:
+    med_pkg = types.ModuleType("medical_segmentation")
+    med_pkg.__path__ = [str(Path(__file__).resolve().parent)]
+    sys.modules["medical_segmentation"] = med_pkg
 
 from medical_segmentation.config import config
 from medical_segmentation.db.database import DatabaseManager
