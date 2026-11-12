@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pydicom
@@ -36,6 +36,47 @@ class VolumetricMetadata:
     window_center: Optional[float] = None
     window_width: Optional[float] = None
     extra_tags: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def voxel_volume_mm3(self) -> float:
+        """Physical volume of a single voxel in mm³."""
+        return float(self.spacing[0] * self.spacing[1] * self.spacing[2])
+
+    @property
+    def pixel_area_axial_mm2(self) -> float:
+        """Physical cross-sectional area of a single axial pixel in mm²."""
+        return float(self.spacing[0] * self.spacing[1])
+
+    def continuous_index_to_physical_point(
+        self,
+        continuous_index: Tuple[float, float, float] | Sequence[float],
+    ) -> Tuple[float, float, float]:
+        """
+        Transform continuous voxel index (X, Y, Z) to physical patient coordinate (x, y, z) in mm,
+        accounting for origin, voxel spacing, and 3D direction cosine matrix.
+
+        Args:
+            continuous_index: Continuous index sequence (cx, cy, cz) in voxel coordinates.
+
+        Returns:
+            Tuple of physical coordinates (px, py, pz) in millimeters.
+        """
+        cx, cy, cz = continuous_index
+        dx, dy, dz = self.spacing
+        ox, oy, oz = self.origin
+
+        if len(self.direction) == 9:
+            d = self.direction
+            px = ox + d[0] * (cx * dx) + d[1] * (cy * dy) + d[2] * (cz * dz)
+            py = oy + d[3] * (cx * dx) + d[4] * (cy * dy) + d[5] * (cz * dz)
+            pz = oz + d[6] * (cx * dx) + d[7] * (cy * dy) + d[8] * (cz * dz)
+            return (float(px), float(py), float(pz))
+
+        return (
+            float(ox + cx * dx),
+            float(oy + cy * dy),
+            float(oz + cz * dz),
+        )
 
 
 class DicomVolumeLoader:
