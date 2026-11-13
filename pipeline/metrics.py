@@ -138,7 +138,11 @@ class VolumetricMetricsCalculator:
         for each segmented label, skipping redundant empty slice evaluations.
         """
         depth, height, width = mask_array.shape
-        pixel_area = metadata.pixel_area_axial_mm2
+        pixel_area = (
+            metadata.pixel_area_slice_mm2
+            if hasattr(metadata, "pixel_area_slice_mm2")
+            else metadata.pixel_area_axial_mm2
+        )
 
         for lbl in unique_labels:
             if label_bounds and lbl in label_bounds:
@@ -156,13 +160,17 @@ class VolumetricMetricsCalculator:
 
                 slice_intensities = raw_array[z, :, :][slice_mask]
                 area_mm2 = float(slice_count * pixel_area)
-                pos_z_mm = metadata.continuous_index_to_physical_point((0.0, 0.0, float(z)))[2]
+                if hasattr(metadata, "get_slice_plane_and_position"):
+                    plane, slice_pos_mm = metadata.get_slice_plane_and_position(z)
+                else:
+                    plane = "axial"
+                    slice_pos_mm = metadata.continuous_index_to_physical_point((0.0, 0.0, float(z)))[2]
 
                 yield {
                     "label_id": lbl,
                     "slice_index": z,
-                    "plane": "axial",
-                    "slice_position_mm": pos_z_mm,
+                    "plane": plane,
+                    "slice_position_mm": slice_pos_mm,
                     "slice_voxel_count": slice_count,
                     "cross_sectional_area_mm2": area_mm2,
                     "mean_intensity": float(np.mean(slice_intensities)),

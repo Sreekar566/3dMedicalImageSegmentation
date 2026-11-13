@@ -43,9 +43,48 @@ class VolumetricMetadata:
         return float(self.spacing[0] * self.spacing[1] * self.spacing[2])
 
     @property
-    def pixel_area_axial_mm2(self) -> float:
-        """Physical cross-sectional area of a single axial pixel in mm²."""
+    def pixel_area_slice_mm2(self) -> float:
+        """Physical cross-sectional area of a single slice pixel (X-Y in voxel space) in mm²."""
         return float(self.spacing[0] * self.spacing[1])
+
+    @property
+    def pixel_area_axial_mm2(self) -> float:
+        """Backward-compatible alias for pixel_area_slice_mm2."""
+        return self.pixel_area_slice_mm2
+
+    def get_slice_plane_and_position(self, slice_index: float | int) -> Tuple[str, float]:
+        """
+        Determine the anatomical slice plane ('axial', 'coronal', or 'sagittal')
+        and physical slice position in millimeters along the slice normal axis.
+
+        Args:
+            slice_index: Continuous or discrete slice index (z) along the volume's third dimension.
+
+        Returns:
+            Tuple of (plane_name, slice_position_mm).
+        """
+        pt = self.continuous_index_to_physical_point((0.0, 0.0, float(slice_index)))
+
+        orient = self.spatial_orientation.upper() if self.spatial_orientation else ""
+        if len(orient) == 3:
+            last_code = orient[2]
+            if last_code in ("S", "I"):
+                return "axial", pt[2]
+            elif last_code in ("A", "P"):
+                return "coronal", pt[1]
+            elif last_code in ("R", "L"):
+                return "sagittal", pt[0]
+
+        if len(self.direction) == 9:
+            dominant_axis = int(np.argmax(np.abs([self.direction[2], self.direction[5], self.direction[8]])))
+            if dominant_axis == 2:
+                return "axial", pt[2]
+            elif dominant_axis == 1:
+                return "coronal", pt[1]
+            else:
+                return "sagittal", pt[0]
+
+        return "axial", pt[2]
 
     def continuous_index_to_physical_point(
         self,

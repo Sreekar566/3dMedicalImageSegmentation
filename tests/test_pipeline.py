@@ -352,3 +352,115 @@ def test_execute_inference_binary_channel() -> None:
     assert mask.dtype == np.uint8
     assert set(np.unique(mask)).issubset({0, 1})
 
+
+def test_volumetric_metadata_slice_plane_and_position_all_anatomical_planes() -> None:
+    """Validate that VolumetricMetadata determines correct anatomical planes and positions for axial, coronal, and sagittal orientations."""
+    # 1. Axial orientation (RAS)
+    img_ras = sitk.Image(10, 20, 30, sitk.sitkFloat32)
+    img_ras.SetSpacing((1.0, 1.0, 2.0))
+    img_ras.SetOrigin((10.0, 20.0, 30.0))
+    img_ras = sitk.DICOMOrient(img_ras, "RAS")
+    meta_ras = VolumetricMetadata(
+        spacing=img_ras.GetSpacing(),
+        origin=img_ras.GetOrigin(),
+        direction=img_ras.GetDirection(),
+        spatial_orientation="RAS",
+    )
+    plane_ras, pos_ras_0 = meta_ras.get_slice_plane_and_position(0)
+    _, pos_ras_5 = meta_ras.get_slice_plane_and_position(5)
+    assert plane_ras == "axial"
+    assert pos_ras_5 != pos_ras_0
+    assert np.isclose(pos_ras_5 - pos_ras_0, 5 * 2.0)
+
+    # 2. Coronal orientation (RSP: X=Right, Y=Superior, Z=Posterior)
+    img_rsp = sitk.Image(10, 20, 30, sitk.sitkFloat32)
+    img_rsp.SetSpacing((1.0, 1.0, 2.0))
+    img_rsp.SetOrigin((10.0, 20.0, 30.0))
+    img_rsp = sitk.DICOMOrient(img_rsp, "RSP")
+    meta_rsp = VolumetricMetadata(
+        spacing=img_rsp.GetSpacing(),
+        origin=img_rsp.GetOrigin(),
+        direction=img_rsp.GetDirection(),
+        spatial_orientation="RSP",
+    )
+    plane_rsp, pos_rsp_0 = meta_rsp.get_slice_plane_and_position(0)
+    _, pos_rsp_5 = meta_rsp.get_slice_plane_and_position(5)
+    assert plane_rsp == "coronal"
+    assert pos_rsp_5 != pos_rsp_0
+
+    # 3. Sagittal orientation (ASR: X=Anterior, Y=Superior, Z=Right)
+    img_asr = sitk.Image(10, 20, 30, sitk.sitkFloat32)
+    img_asr.SetSpacing((1.0, 1.0, 2.0))
+    img_asr.SetOrigin((10.0, 20.0, 30.0))
+    img_asr = sitk.DICOMOrient(img_asr, "ASR")
+    meta_asr = VolumetricMetadata(
+        spacing=img_asr.GetSpacing(),
+        origin=img_asr.GetOrigin(),
+        direction=img_asr.GetDirection(),
+        spatial_orientation="ASR",
+    )
+    plane_asr, pos_asr_0 = meta_asr.get_slice_plane_and_position(0)
+    _, pos_asr_5 = meta_asr.get_slice_plane_and_position(5)
+    assert plane_asr == "sagittal"
+    assert pos_asr_5 != pos_asr_0
+
+    # 4. Fallback using direction cosine matrix when spatial_orientation is empty
+    meta_fallback = VolumetricMetadata(
+        spacing=img_rsp.GetSpacing(),
+        origin=img_rsp.GetOrigin(),
+        direction=img_rsp.GetDirection(),
+        spatial_orientation="",
+    )
+    plane_fb, pos_fb = meta_fallback.get_slice_plane_and_position(0)
+    assert plane_fb == "coronal"
+
+
+def test_generate_slice_metrics_coronal_and_sagittal_planes() -> None:
+    """Validate that generate_slice_metrics correctly assigns coronal and sagittal plane labels and varying positions."""
+    calc = VolumetricMetricsCalculator()
+    raw = np.full((10, 10, 10), fill_value=100.0, dtype=np.float32)
+    mask = np.zeros((10, 10, 10), dtype=np.uint8)
+    mask[2:5, :, :] = 1  # Slices 2, 3, 4
+
+    # Test Coronal
+    img_coronal = sitk.Image(10, 10, 10, sitk.sitkFloat32)
+    img_coronal.SetSpacing((1.0, 1.0, 2.0))
+    img_coronal.SetOrigin((0.0, 0.0, 0.0))
+    img_coronal = sitk.DICOMOrient(img_coronal, "RSP")
+    meta_coronal = VolumetricMetadata(
+        dimensions=(10, 10, 10),
+        spacing=img_coronal.GetSpacing(),
+        origin=img_coronal.GetOrigin(),
+        direction=img_coronal.GetDirection(),
+        spatial_orientation="RSP",
+    )
+
+    _, slice_gen_coronal = calc.compute_metrics(raw, mask, meta_coronal)
+    coronal_slices = list(slice_gen_coronal)
+    assert len(coronal_slices) == 3
+    for s in coronal_slices:
+        assert s["plane"] == "coronal"
+    positions = [s["slice_position_mm"] for s in coronal_slices]
+    # Slices must have distinct physical positions
+    assert len(set(positions)) == 3
+    assert positions[0] != positions[1]
+
+    # Test Sagittal
+    img_sagittal = sitk.DICOMOrient(img_coronal, "ASR")
+    meta_sagittal = VolumetricMetadata(
+        dimensions=(10, 10, 10),
+        spacing=img_sagittal.GetSpacing(),
+        origin=img_sagittal.GetOrigin(),
+        direction=img_sagittal.GetDirection(),
+        spatial_orientation="ASR",
+    )
+
+    _, slice_gen_sagittal = calc.compute_metrics(raw, mask, meta_sagittal)
+    sagittal_slices = list(slice_gen_sagittal)
+    assert len(sagittal_slices) == 3
+    for s in sagittal_slices:
+        assert s["plane"] == "sagittal"
+    positions_sag = [s["slice_position_mm"] for s in sagittal_slices]
+    assert len(set(positions_sag)) == 3
+
+
