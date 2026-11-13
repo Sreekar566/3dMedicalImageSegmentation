@@ -10,10 +10,13 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 import torch
+from sqlalchemy import create_engine
 
-from medical_segmentation.config import InferenceSettings, PipelineConfig
-from medical_segmentation.db.database import chunked_iterable
+from medical_segmentation.config import DatabaseSettings, InferenceSettings, PipelineConfig
+from medical_segmentation.db.database import DatabaseManager, chunked_iterable
 from medical_segmentation.io.dicom_loader import DicomVolumeLoader, VolumetricMetadata
+from medical_segmentation.main import run_pipeline
+from medical_segmentation.pipeline import PipelineOrchestrator, PipelineResult
 from medical_segmentation.pipeline.inference import (
     SlidingWindowInferenceEngine,
     VolumetricMetricsCalculator,
@@ -462,5 +465,104 @@ def test_generate_slice_metrics_coronal_and_sagittal_planes() -> None:
         assert s["plane"] == "sagittal"
     positions_sag = [s["slice_position_mm"] for s in sagittal_slices]
     assert len(set(positions_sag)) == 3
+
+
+def test_pipeline_orchestrator_local_dry_run(tmp_path: Path) -> None:
+    """Verify that PipelineOrchestrator successfully executes an end-to-end run in local dry-run mode."""
+    arr = np.random.uniform(low=-100.0, high=200.0, size=(32, 32, 32)).astype(np.float32)
+    img = sitk.GetImageFromArray(arr)
+    img.SetSpacing((1.5, 1.5, 2.0))
+    img.SetOrigin((0.0, 0.0, 0.0))
+
+    volume_path = tmp_path / "test_volume.nii.gz"
+    sitk.WriteImage(img, str(volume_path))
+
+    workspace_dir = tmp_path / "workspace"
+    cfg = PipelineConfig()
+    cfg.work_dir = workspace_dir
+    cfg.inference.roi_size = (32, 32, 32)
+    cfg.inference.target_spacing = None
+    cfg.inference.device = "cpu"
+
+    orchestrator = PipelineOrchestrator(config=cfg, workspace=workspace_dir)
+    result = orchestrator.run(
+        local_input=volume_path,
+        modality="CT",
+        dry_run=True,
+    )
+
+    assert isinstance(result, PipelineResult)
+    assert result.duration_seconds > 0.0
+    assert result.mask_array.shape == (32, 32, 32)
+    assert result.local_mask_path.is_file()
+    assert result.output_blob_uri is None
+    assert result.study_id is None
+    assert result.run_id is None
+    assert result.slices_inserted == 0
+    assert result.metadata.dimensions == (32, 32, 32)
+
+
+def test_pipeline_orchestrator_ingest_volume_validation(tmp_path: Path) -> None:
+    """Verify that ingest_volume enforces input source presence and file existence."""
+    orchestrator = PipelineOrchestrator()
+
+    with pytest.raises(ValueError, match="No input volume source specified"):
+        orchestrator.ingest_volume()
+
+    missing_path = tmp_path / "non_existent.nii.gz"
+    with pytest.raises(FileNotFoundError, match="Local input path not found"):
+        orchestrator.ingest_volume(local_input=missing_path)
+
+
+def test_pipeline_orchestrator_database_persistence() -> None:
+    """Verify that persist_to_database records study, run, and chunked slice metrics."""
+    engine = create_engine("sqlite:///:memory:")
+    db_manager = DatabaseManager(DatabaseSettings(), engine=engine)
+
+    orchestrator = PipelineOrchestrator(db_manager=db_manager)
+
+    meta = VolumetricMetadata(
+        patient_id="PATIENT_99",
+        study_instance_uid="STUDY_99",
+        series_instance_uid="SERIES_99",
+        dimensions=(16, 16, 16),
+        spacing=(1.0, 1.0, 1.0),
+    )
+
+    calc = VolumetricMetricsCalculator()
+    raw = np.full((16, 16, 16), fill_value=120.0, dtype=np.float32)
+    mask = np.zeros((16, 16, 16), dtype=np.uint8)
+    mask[4:8, 4:8, 4:8] = 1
+
+    summary_metrics, slice_gen = calc.compute_metrics(raw, mask, meta, duration_seconds=0.5)
+
+    study_id, run_id, inserted_count = orchestrator.persist_to_database(
+        metadata=meta,
+        summary_metrics=summary_metrics,
+        slice_generator=slice_gen,
+        batch_size=2,
+        dry_run=False,
+    )
+
+    assert study_id is not None
+    assert run_id is not None
+    assert inserted_count == 4
+
+
+def test_main_run_pipeline_cli_wrapper(tmp_path: Path) -> None:
+    """Validate that run_pipeline CLI wrapper executes cleanly on local inputs and handles failures."""
+    arr = np.zeros((32, 32, 32), dtype=np.float32)
+    img = sitk.GetImageFromArray(arr)
+    vol_path = tmp_path / "cli_vol.nii.gz"
+    sitk.WriteImage(img, str(vol_path))
+
+    # Success case
+    exit_code = run_pipeline(local_input=vol_path, dry_run=True)
+    assert exit_code == 0
+
+    # Failure case (missing input)
+    err_code = run_pipeline()
+    assert err_code == 1
+
 
 

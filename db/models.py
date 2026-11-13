@@ -32,7 +32,7 @@ class PatientStudy(Base):
 
     __tablename__ = "patient_studies"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer().with_variant(BigInteger, "postgresql"), primary_key=True, autoincrement=True)
     patient_id: Mapped[str] = mapped_column(String(128), index=True, default="ANONYMOUS")
     study_instance_uid: Mapped[str] = mapped_column(String(256), index=True)
     series_instance_uid: Mapped[str] = mapped_column(String(256), index=True)
@@ -67,9 +67,9 @@ class SegmentationRun(Base):
 
     __tablename__ = "segmentation_runs"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer().with_variant(BigInteger, "postgresql"), primary_key=True, autoincrement=True)
     study_id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer().with_variant(BigInteger, "postgresql"),
         ForeignKey("patient_studies.id", ondelete="CASCADE"),
         index=True,
     )
@@ -103,16 +103,16 @@ class VolumeMetric(Base):
 
     __tablename__ = "volume_metrics"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer().with_variant(BigInteger, "postgresql"), primary_key=True, autoincrement=True)
     run_id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer().with_variant(BigInteger, "postgresql"),
         ForeignKey("segmentation_runs.id", ondelete="CASCADE"),
         index=True,
     )
     label_id: Mapped[int] = mapped_column(Integer, nullable=False)
     structure_name: Mapped[str] = mapped_column(String(128), default="Structure")
 
-    voxel_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    voxel_count: Mapped[int] = mapped_column(Integer().with_variant(BigInteger, "postgresql"), nullable=False)
     volume_mm3: Mapped[float] = mapped_column(Float, nullable=False)
     volume_cm3: Mapped[float] = mapped_column(Float, nullable=False)
 
@@ -144,9 +144,9 @@ class VoxelSliceMetric(Base):
 
     __tablename__ = "voxel_slice_metrics"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(Integer().with_variant(BigInteger, "postgresql"), primary_key=True, autoincrement=True)
     run_id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer().with_variant(BigInteger, "postgresql"),
         ForeignKey("segmentation_runs.id", ondelete="CASCADE"),
         nullable=False,
     )

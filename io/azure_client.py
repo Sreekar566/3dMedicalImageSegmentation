@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import io
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 from azure.core.exceptions import AzureError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
@@ -152,16 +153,21 @@ class AzureBlobClient:
                 return []
 
             logger.info("Found %d slice blobs under prefix '%s'. Starting concurrent download.", len(blobs), prefix)
-            for blob in blobs:
-                filename = Path(blob.name).name
+
+            def _download_single_blob(blob_item: Any) -> Path:
+                filename = Path(blob_item.name).name
                 dest_file = destination_dir / filename
-
-                blob_client = container_client.get_blob_client(blob.name)
+                blob_client = container_client.get_blob_client(blob_item.name)
                 with open(dest_file, "wb") as f:
-                    blob_data = blob_client.download_blob(max_concurrency=self.settings.max_concurrency)
+                    blob_data = blob_client.download_blob(
+                        max_concurrency=self.settings.max_concurrency,
+                        timeout=self.settings.timeout_seconds,
+                    )
                     blob_data.readinto(f)
+                return dest_file
 
-                downloaded_files.append(dest_file)
+            with ThreadPoolExecutor(max_workers=self.settings.max_concurrency) as executor:
+                downloaded_files = list(executor.map(_download_single_blob, blobs))
 
             logger.info("Successfully downloaded %d DICOM slices to '%s'.", len(downloaded_files), destination_dir)
             return downloaded_files

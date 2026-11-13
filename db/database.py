@@ -25,7 +25,7 @@ from medical_segmentation.db.models import (
     VoxelSliceMetric,
 )
 from medical_segmentation.io.dicom_loader import VolumetricMetadata
-from medical_segmentation.pipeline.inference import SegmentationMetrics
+from medical_segmentation.pipeline.metrics import SegmentationMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -53,27 +53,30 @@ def chunked_iterable(iterable: Iterable[Any], chunk_size: int = 500) -> Generato
 class DatabaseManager:
     """Manages PostgreSQL connection pooling, schema lifecycle, and bulk chunked insertion."""
 
-    def __init__(self, settings: DatabaseSettings):
+    def __init__(self, settings: DatabaseSettings, engine: Optional[Any] = None):
         self.settings = settings
-        logger.info(
-            "Configuring PostgreSQL connection pool for host '%s', database '%s' (pool_size=%d, max_overflow=%d, batch_size=%d).",
-            settings.host,
-            settings.name,
-            settings.pool_size,
-            settings.max_overflow,
-            settings.batch_size,
-        )
+        if engine is not None:
+            self.engine = engine
+        else:
+            logger.info(
+                "Configuring PostgreSQL connection pool for host '%s', database '%s' (pool_size=%d, max_overflow=%d, batch_size=%d).",
+                settings.host,
+                settings.name,
+                settings.pool_size,
+                settings.max_overflow,
+                settings.batch_size,
+            )
 
-        self.engine = create_engine(
-            self.settings.connection_url,
-            poolclass=QueuePool,
-            pool_size=self.settings.pool_size,
-            max_overflow=self.settings.max_overflow,
-            pool_timeout=self.settings.pool_timeout,
-            pool_pre_ping=True,      # Tests connection liveness before checkout
-            pool_recycle=1800,        # Recycles connections every 30 minutes to avoid Azure idle timeouts
-            echo=False,
-        )
+            self.engine = create_engine(
+                self.settings.connection_url,
+                poolclass=QueuePool,
+                pool_size=self.settings.pool_size,
+                max_overflow=self.settings.max_overflow,
+                pool_timeout=self.settings.pool_timeout,
+                pool_pre_ping=True,      # Tests connection liveness before checkout
+                pool_recycle=1800,        # Recycles connections every 30 minutes to avoid Azure idle timeouts
+                echo=False,
+            )
 
         self.SessionFactory = sessionmaker(
             bind=self.engine,
