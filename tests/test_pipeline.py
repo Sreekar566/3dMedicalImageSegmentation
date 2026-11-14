@@ -631,4 +631,72 @@ def test_main_run_pipeline_cli_wrapper(tmp_path: Path) -> None:
     assert err_code == 1
 
 
+def test_volumetric_metrics_calculator_decoupled_helpers() -> None:
+    """Validate extracted helper methods in VolumetricMetricsCalculator."""
+    calc = VolumetricMetricsCalculator()
+
+    # 1. Intensity statistics helper
+    raw = np.array([[[10.0, 20.0], [30.0, 40.0]]], dtype=np.float32)
+    mask = np.array([[[True, False], [True, True]]], dtype=bool)
+    mean_val, std_val, min_val, max_val = calc._compute_intensity_statistics(raw, mask)
+    expected_vals = [10.0, 30.0, 40.0]
+    assert np.isclose(mean_val, np.mean(expected_vals))
+    assert np.isclose(std_val, np.std(expected_vals))
+    assert min_val == 10.0
+    assert max_val == 40.0
+
+    # 2. 1D orthogonal projection spatial bounds and centroid
+    label_mask = np.zeros((10, 12, 14), dtype=bool)
+    label_mask[2:6, 3:8, 4:10] = True  # Z: 2..5, Y: 3..7, X: 4..9
+    voxel_count = int(np.count_nonzero(label_mask))
+    meta = VolumetricMetadata(
+        spacing=(2.0, 3.0, 4.0),
+        origin=(10.0, 20.0, 30.0),
+        spatial_orientation="RAS",
+    )
+
+    bbox, centroid_mm, z_counts = calc._compute_spatial_bounds_and_centroid(label_mask, meta, voxel_count)
+    assert bbox == (4, 3, 2, 9, 7, 5)
+    # Centroid continuous index: mean of [4..9] is 6.5, mean of [3..7] is 5.0, mean of [2..5] is 3.5
+    expected_physical = meta.continuous_index_to_physical_point((6.5, 5.0, 3.5))
+    assert np.allclose(centroid_mm, expected_physical)
+    assert len(z_counts) == 10
+    assert z_counts[0] == 0
+    assert z_counts[2] == 5 * 6  # Y len * X len = 30
+
+    # 3. Slice plane and positions helper
+    plane = calc._resolve_slice_plane(meta)
+    assert plane == "axial"
+    positions = calc._compute_slice_positions(meta, depth=10)
+    assert len(positions) == 10
+    assert np.isclose(positions[1] - positions[0], 4.0)
+
+    # 4. Slice record builder
+    slice_intensities = np.array([100.0, 200.0], dtype=np.float32)
+    record = calc._build_slice_record(
+        label_id=1,
+        slice_index=3,
+        plane="axial",
+        slice_position_mm=42.0,
+        slice_voxel_count=2,
+        pixel_area=6.0,
+        slice_intensities=slice_intensities,
+    )
+    assert record["label_id"] == 1
+    assert record["slice_index"] == 3
+    assert record["plane"] == "axial"
+    assert record["slice_position_mm"] == 42.0
+    assert record["slice_voxel_count"] == 2
+    assert record["cross_sectional_area_mm2"] == 12.0
+    assert record["mean_intensity"] == 150.0
+    assert record["max_intensity"] == 200.0
+
+    # 5. Empty mask returns None, None from _compute_label_summary_with_counts
+    empty_mask = np.zeros((5, 5, 5), dtype=bool)
+    summary, counts = calc._compute_label_summary_with_counts(np.zeros((5, 5, 5), dtype=np.float32), empty_mask, 1, meta)
+    assert summary is None
+    assert counts is None
+
+
+
 
