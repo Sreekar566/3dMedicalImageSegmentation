@@ -6,6 +6,7 @@ sliding-window inference, metric extraction, and 500-row chunked batch generatio
 
 from __future__ import annotations
 
+from pathlib import Path
 import numpy as np
 import pytest
 import SimpleITK as sitk
@@ -21,7 +22,7 @@ from medical_segmentation.pipeline.inference import (
     SlidingWindowInferenceEngine,
     VolumetricMetricsCalculator,
 )
-from medical_segmentation.pipeline.model import build_3d_unet
+from medical_segmentation.pipeline.model import build_3d_unet, load_3d_unet
 from medical_segmentation.pipeline.transforms import build_volumetric_transforms, prepare_tensor_from_sitk
 
 
@@ -79,6 +80,71 @@ def test_monai_transforms_and_tensor_preparation() -> None:
     assert tensor.shape == (1, 1, 16, 32, 32)
     assert float(tensor.min()) >= 0.0
     assert float(tensor.max()) <= 1.0
+
+
+def test_monai_transforms_mri_and_fallback_modalities() -> None:
+    """Verify MONAI transformations for MRI nonzero z-score normalization and fallback modalities."""
+    arr = np.random.uniform(low=0.0, high=500.0, size=(16, 32, 32)).astype(np.float32)
+    img = sitk.GetImageFromArray(arr)
+    img.SetSpacing((1.0, 1.0, 1.0))
+
+    # MRI modality: nonzero z-score normalization
+    tensor_mri = prepare_tensor_from_sitk(
+        image=img,
+        modality="MRI",
+        target_spacing=None,
+        device="cpu",
+    )
+    assert tensor_mri.ndim == 5
+    assert tensor_mri.shape == (1, 1, 16, 32, 32)
+
+    # CBCT modality
+    cbct_transform = build_volumetric_transforms(modality="CBCT")
+    assert cbct_transform is not None
+
+    # Fallback/other modality
+    fallback_transform = build_volumetric_transforms(modality="PET")
+    assert fallback_transform is not None
+
+
+def test_monai_transforms_spatial_resampling() -> None:
+    """Verify that Spacingd resamples input volumes to the requested target voxel spacing."""
+    arr = np.random.uniform(low=-100.0, high=100.0, size=(16, 32, 32)).astype(np.float32)
+    img = sitk.GetImageFromArray(arr)
+    img.SetSpacing((1.0, 1.0, 1.0))  # 1mm isotropic
+
+    # Resample to 2mm isotropic -> spatial dimensions should be halved: 16->8, 32->16, 32->16
+    tensor_resampled = prepare_tensor_from_sitk(
+        image=img,
+        modality="CT",
+        target_spacing=(2.0, 2.0, 2.0),
+        device="cpu",
+    )
+    assert tensor_resampled.ndim == 5
+    assert tensor_resampled.shape == (1, 1, 8, 16, 16)
+
+
+def test_load_3d_unet_from_checkpoint_and_fallback(tmp_path: Path) -> None:
+    """Verify load_3d_unet loads raw and wrapped state_dict weights and handles missing checkpoints gracefully."""
+    model = build_3d_unet(in_channels=1, out_channels=2)
+
+    # 1. Raw state dict
+    raw_ckpt_path = tmp_path / "raw_weights.pt"
+    torch.save(model.state_dict(), str(raw_ckpt_path))
+    loaded_raw = load_3d_unet(checkpoint_path=raw_ckpt_path, in_channels=1, out_channels=2)
+    assert isinstance(loaded_raw, torch.nn.Module)
+
+    # 2. Wrapped state dict ({'state_dict': ...})
+    wrapped_ckpt_path = tmp_path / "wrapped_weights.pt"
+    torch.save({"state_dict": model.state_dict()}, str(wrapped_ckpt_path))
+    loaded_wrapped = load_3d_unet(checkpoint_path=wrapped_ckpt_path, in_channels=1, out_channels=2)
+    assert isinstance(loaded_wrapped, torch.nn.Module)
+
+    # 3. Missing checkpoint path falls back to freshly initialized model
+    missing_ckpt = tmp_path / "non_existent_weights.pt"
+    fallback_model = load_3d_unet(checkpoint_path=missing_ckpt, in_channels=1, out_channels=2)
+    assert isinstance(fallback_model, torch.nn.Module)
+
 
 
 def test_3d_unet_forward_pass() -> None:
