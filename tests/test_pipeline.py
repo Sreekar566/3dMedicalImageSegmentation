@@ -24,7 +24,7 @@ from medical_segmentation.config import (
 )
 from medical_segmentation.db.database import DatabaseManager, chunked_iterable
 from medical_segmentation.io.dicom_loader import DicomVolumeLoader, VolumetricMetadata
-from medical_segmentation.main import run_pipeline
+from medical_segmentation.main import main, parse_args, run_pipeline
 from medical_segmentation.pipeline import PipelineOrchestrator, PipelineResult
 from medical_segmentation.pipeline.inference import (
     SlidingWindowInferenceEngine,
@@ -1069,7 +1069,116 @@ LOG_LEVEL="DEBUG"
     assert pipe_cfg.log_level == "DEBUG"
 
 
+def test_main_parse_args_options(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Validate argument parsing for local-input, blob-path, series-prefix, and optional flags."""
+    vol_file = tmp_path / "sample.nii.gz"
+    ckpt_file = tmp_path / "model.pt"
+
+    # 1. Local input with defaults
+    monkeypatch.setattr("sys.argv", ["main.py", "--local-input", str(vol_file)])
+    args = parse_args()
+    assert args.local_input == vol_file
+    assert args.blob_path is None
+    assert args.series_prefix is None
+    assert args.modality == "CT"
+    assert args.orientation == "RAS"
+    assert args.dry_run is False
+
+    # 2. Blob path with custom options
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "--blob-path",
+            "scans/patient_01.nii.gz",
+            "--container",
+            "custom-in",
+            "--output-container",
+            "custom-out",
+            "--modality",
+            "MRI",
+            "--orientation",
+            "LPS",
+            "--checkpoint",
+            str(ckpt_file),
+            "--batch-size",
+            "250",
+            "--dry-run",
+        ],
+    )
+    args = parse_args()
+    assert args.blob_path == "scans/patient_01.nii.gz"
+    assert args.local_input is None
+    assert args.container == "custom-in"
+    assert args.output_container == "custom-out"
+    assert args.modality == "MRI"
+    assert args.orientation == "LPS"
+    assert args.checkpoint == ckpt_file
+    assert args.batch_size == 250
+    assert args.dry_run is True
+
+    # 3. Series prefix
+    monkeypatch.setattr("sys.argv", ["main.py", "--series-prefix", "dicom/series_001/"])
+    args = parse_args()
+    assert args.series_prefix == "dicom/series_001/"
+    assert args.blob_path is None
+    assert args.local_input is None
 
 
+def test_main_parse_args_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify parse_args rejects missing inputs, conflicting inputs, and invalid choices."""
+    # Missing input
+    monkeypatch.setattr("sys.argv", ["main.py"])
+    with pytest.raises(SystemExit) as exc_info:
+        parse_args()
+    assert exc_info.value.code != 0
+
+    # Conflicting mutually exclusive inputs
+    monkeypatch.setattr("sys.argv", ["main.py", "--local-input", "vol.nii", "--blob-path", "blob.nii"])
+    with pytest.raises(SystemExit) as exc_info:
+        parse_args()
+    assert exc_info.value.code != 0
+
+    # Invalid modality choice
+    monkeypatch.setattr("sys.argv", ["main.py", "--local-input", "vol.nii", "--modality", "XRAY"])
+    with pytest.raises(SystemExit) as exc_info:
+        parse_args()
+    assert exc_info.value.code != 0
+
+
+def test_main_entrypoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify main() entrypoint parses arguments, executes run_pipeline, and invokes sys.exit."""
+    from unittest.mock import MagicMock, patch
+
+    mock_args = MagicMock(
+        blob_path="blob.nii",
+        series_prefix=None,
+        local_input=None,
+        container="in-container",
+        output_container="out-container",
+        modality="CT",
+        orientation="RAS",
+        checkpoint=None,
+        batch_size=500,
+        dry_run=True,
+    )
+
+    with patch("medical_segmentation.main.parse_args", return_value=mock_args):
+        with patch("medical_segmentation.main.run_pipeline", return_value=0) as mock_run:
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+            assert exc_info.value.code == 0
+            mock_run.assert_called_once_with(
+                blob_path="blob.nii",
+                series_prefix=None,
+                local_input=None,
+                input_container="in-container",
+                output_container="out-container",
+                modality="CT",
+                orientation="RAS",
+                checkpoint=None,
+                batch_size=500,
+                dry_run=True,
+            )
 
 

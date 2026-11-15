@@ -208,7 +208,7 @@ class DatabaseManager:
         Returns:
             Total number of slice metric rows successfully persisted.
         """
-        effective_batch_size = batch_size or self.settings.batch_size
+        effective_batch_size = self.settings.batch_size if batch_size is None else batch_size
         if effective_batch_size <= 0:
             raise ValueError(f"batch_size must be a strictly positive integer, got {effective_batch_size}.")
         logger.info(

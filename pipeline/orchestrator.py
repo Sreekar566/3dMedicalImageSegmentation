@@ -308,9 +308,9 @@ class PipelineOrchestrator:
             logger.info("Dry-run active; skipped PostgreSQL persistence.")
             return None, None, 0
 
-        effective_batch_size = batch_size or self.config.db.batch_size
+        effective_batch_size = self.config.db.batch_size if batch_size is None else batch_size
         if effective_batch_size <= 0:
-            raise ValueError(f"batch_size must be a positive integer, got {effective_batch_size}")
+            raise ValueError(f"batch_size must be a strictly positive integer, got {effective_batch_size}.")
         try:
             if self.db_manager is not None:
                 db = self.db_manager
