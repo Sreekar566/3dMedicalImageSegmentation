@@ -12,7 +12,7 @@ import logging
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, Iterable, Iterator, List, Optional, Tuple
 
-from sqlalchemy import create_engine, insert
+from sqlalchemy import create_engine, insert, text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
@@ -96,6 +96,21 @@ class DatabaseManager:
         except Exception as exc:
             logger.error("Failed to initialize database tables: %s", exc)
             raise
+
+    def check_connection(self) -> bool:
+        """
+        Verify database connectivity and responsiveness with a lightweight ping.
+
+        Returns:
+            True if database is reachable and responsive, False otherwise.
+        """
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            return True
+        except Exception as exc:
+            logger.warning("Database connection check failed: %s", exc)
+            return False
 
     @contextmanager
     def get_session(self) -> Generator[Session, None, None]:

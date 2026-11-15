@@ -57,6 +57,9 @@ Designed for automated, high-throughput volumetric processing of 3D CBCT, CT, an
 
 ```text
 3dMedicalImageSegmentation/
+├── .github/
+│   └── workflows/
+│       └── ci.yml            # Automated CI/CD test and healthcheck workflow
 ├── config.py                 # Azure credentials, inference params, DB configs via Pydantic Settings
 ├── io/
 │   ├── __init__.py
@@ -73,9 +76,16 @@ Designed for automated, high-throughput volumetric processing of 3D CBCT, CT, an
 │   └── database.py           # Connection pool & 500-row chunked batched insert logic
 ├── tests/
 │   ├── __init__.py
+│   ├── test_db.py            # Unit & integration tests for database models and pool
+│   ├── test_healthcheck.py   # System health probe and connectivity tests
+│   ├── test_io.py            # Ingestion and Azure client tests
 │   └── test_pipeline.py      # Unit tests for transforms, models, metrics, and batching
-├── main.py                   # CLI/pipeline orchestration entry point
+├── Dockerfile                # Production-hardened container definition with healthcheck
+├── docker-compose.yml        # Orchestrated PostgreSQL 16 & pipeline services
+├── Makefile                  # Developer tooling commands (test, healthcheck, compose)
+├── main.py                   # CLI/pipeline orchestration and healthcheck entry point
 ├── requirements.txt          # Pinned production dependencies
+├── .dockerignore             # Docker build context exclusions
 ├── .env.example              # Sample environment configuration
 ├── ROADMAP.md                # Multi-phase roadmap and milestones
 └── README.md                 # Complete documentation and architecture guide
@@ -180,6 +190,65 @@ python -m 3dMedicalImageSegmentation.main \
     --dry-run
 ```
 
+### System Diagnostics & Health Check
+
+Run automated health diagnostics verifying Python environment, PyTorch execution device, SimpleITK C++ bindings, MONAI network initialization, and workspace volume permissions:
+
+```bash
+python -m main --check-health
+```
+
+To additionally verify PostgreSQL database connectivity and responsiveness:
+
+```bash
+python -m main --check-health --check-db
+```
+
+---
+
+## Docker & Container Deployment
+
+A production-hardened `Dockerfile` and `docker-compose.yml` are provided for containerized execution and local database orchestration.
+
+### 1. Launch Stack with Docker Compose
+
+Spin up PostgreSQL 16 Alpine and the pipeline container with integrated service healthchecks:
+
+```bash
+docker compose up -d
+```
+
+Compose ensures the segmentation pipeline container waits for PostgreSQL to pass its `pg_isready` healthcheck before initializing.
+
+### 2. Check Service Health & Logs
+
+```bash
+docker compose ps
+docker compose logs -f
+```
+
+### 3. Build Container Image Manually
+
+```bash
+docker build -t medseg-pipeline:latest .
+```
+
+---
+
+## Developer Tooling
+
+A `Makefile` is provided for rapid local development workflows:
+
+```bash
+make help          # List all available targets
+make install       # Install pinned requirements
+make test          # Execute pytest test suite
+make healthcheck   # Run system diagnostics probe
+make docker-up     # Launch PostgreSQL and pipeline via compose
+make docker-down   # Tear down compose services and networks
+make clean         # Remove python bytecode and test caches
+```
+
 ---
 
 ## Running Unit Tests
@@ -187,5 +256,5 @@ python -m 3dMedicalImageSegmentation.main \
 Run the test suite verifying orientation transforms, sliding-window inference, metric extraction, and 500-row batching:
 
 ```bash
-pytest 3dMedicalImageSegmentation/tests/ -v
+pytest tests/ -v
 ```

@@ -1,0 +1,62 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: medseg-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: medical_imaging
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d medical_imaging"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - medseg-net
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: medseg-pipeline
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=medical_imaging
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DB_SSLMODE=disable
+      - INFERENCE_DEVICE=cpu
+      - WORK_DIR=/tmp/medical_segmentation_workspace
+      - LOG_LEVEL=INFO
+    volumes:
+      - workspace_data:/tmp/medical_segmentation_workspace
+    healthcheck:
+      test: ["CMD", "python", "-m", "main", "--check-health", "--check-db"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - medseg-net
+
+volumes:
+  postgres_data:
+    name: medseg_postgres_data
+  workspace_data:
+    name: medseg_workspace_data
+
+networks:
+  medseg-net:
+    name: medseg_network
+    driver: bridge
