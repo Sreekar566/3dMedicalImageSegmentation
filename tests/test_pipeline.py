@@ -22,7 +22,7 @@ from medical_segmentation.pipeline.inference import (
     SlidingWindowInferenceEngine,
     VolumetricMetricsCalculator,
 )
-from medical_segmentation.pipeline.model import build_3d_unet, load_3d_unet
+from medical_segmentation.pipeline.model import build_3d_unet, extract_state_dict, load_3d_unet
 from medical_segmentation.pipeline.transforms import build_volumetric_transforms, prepare_tensor_from_sitk
 
 
@@ -127,23 +127,93 @@ def test_monai_transforms_spatial_resampling() -> None:
 def test_load_3d_unet_from_checkpoint_and_fallback(tmp_path: Path) -> None:
     """Verify load_3d_unet loads raw and wrapped state_dict weights and handles missing checkpoints gracefully."""
     model = build_3d_unet(in_channels=1, out_channels=2)
+    for p in model.parameters():
+        p.data.fill_(42.0)
 
     # 1. Raw state dict
     raw_ckpt_path = tmp_path / "raw_weights.pt"
     torch.save(model.state_dict(), str(raw_ckpt_path))
     loaded_raw = load_3d_unet(checkpoint_path=raw_ckpt_path, in_channels=1, out_channels=2)
     assert isinstance(loaded_raw, torch.nn.Module)
+    assert torch.allclose(next(loaded_raw.parameters()), torch.full_like(next(loaded_raw.parameters()), 42.0))
 
     # 2. Wrapped state dict ({'state_dict': ...})
     wrapped_ckpt_path = tmp_path / "wrapped_weights.pt"
     torch.save({"state_dict": model.state_dict()}, str(wrapped_ckpt_path))
     loaded_wrapped = load_3d_unet(checkpoint_path=wrapped_ckpt_path, in_channels=1, out_channels=2)
     assert isinstance(loaded_wrapped, torch.nn.Module)
+    assert torch.allclose(next(loaded_wrapped.parameters()), torch.full_like(next(loaded_wrapped.parameters()), 42.0))
 
     # 3. Missing checkpoint path falls back to freshly initialized model
     missing_ckpt = tmp_path / "non_existent_weights.pt"
     fallback_model = load_3d_unet(checkpoint_path=missing_ckpt, in_channels=1, out_channels=2)
     assert isinstance(fallback_model, torch.nn.Module)
+
+
+def test_load_3d_unet_ddp_and_model_state_dict_variants(tmp_path: Path) -> None:
+    """Verify load_3d_unet loads DDP ('module.'), compile ('_orig_mod.'), and wrapped ('model_state_dict') checkpoints."""
+    model = build_3d_unet(in_channels=1, out_channels=2)
+    for p in model.parameters():
+        p.data.fill_(99.5)
+
+    # 1. DDP multi-GPU prefix ('module.')
+    ddp_ckpt = tmp_path / "ddp_weights.pt"
+    torch.save({"module." + k: v for k, v in model.state_dict().items()}, str(ddp_ckpt))
+    loaded_ddp = load_3d_unet(checkpoint_path=ddp_ckpt, in_channels=1, out_channels=2)
+    assert torch.allclose(next(loaded_ddp.parameters()), torch.full_like(next(loaded_ddp.parameters()), 99.5))
+
+    # 2. torch.compile prefix ('_orig_mod.')
+    compile_ckpt = tmp_path / "compile_weights.pt"
+    torch.save({"_orig_mod." + k: v for k, v in model.state_dict().items()}, str(compile_ckpt))
+    loaded_compile = load_3d_unet(checkpoint_path=compile_ckpt, in_channels=1, out_channels=2)
+    assert torch.allclose(next(loaded_compile.parameters()), torch.full_like(next(loaded_compile.parameters()), 99.5))
+
+    # 3. Wrapped in 'model_state_dict' (standard PyTorch idiom)
+    msd_ckpt = tmp_path / "msd_weights.pt"
+    torch.save({"model_state_dict": model.state_dict(), "epoch": 10}, str(msd_ckpt))
+    loaded_msd = load_3d_unet(checkpoint_path=msd_ckpt, in_channels=1, out_channels=2)
+    assert torch.allclose(next(loaded_msd.parameters()), torch.full_like(next(loaded_msd.parameters()), 99.5))
+
+    # 4. DDP inside wrapped dictionary
+    nested_ckpt = tmp_path / "nested_ddp.pt"
+    torch.save({"model_state_dict": {"module." + k: v for k, v in model.state_dict().items()}}, str(nested_ckpt))
+    loaded_nested = load_3d_unet(checkpoint_path=nested_ckpt, in_channels=1, out_channels=2)
+    assert torch.allclose(next(loaded_nested.parameters()), torch.full_like(next(loaded_nested.parameters()), 99.5))
+
+    # 5. Full serialized nn.Module instance
+    full_ckpt = tmp_path / "full_module.pt"
+    torch.save(model, str(full_ckpt))
+    loaded_full = load_3d_unet(checkpoint_path=full_ckpt, in_channels=1, out_channels=2)
+    assert torch.allclose(next(loaded_full.parameters()), torch.full_like(next(loaded_full.parameters()), 99.5))
+
+
+def test_load_3d_unet_incompatible_checkpoint_raises_value_error(tmp_path: Path) -> None:
+    """Verify that attempting to load a checkpoint with zero matching parameters raises ValueError."""
+    bad_ckpt = tmp_path / "bad_checkpoint.pt"
+    torch.save({"irrelevant_tensor": torch.randn(4, 4)}, str(bad_ckpt))
+
+    with pytest.raises(ValueError, match="no matching weights found for 3D U-Net"):
+        load_3d_unet(checkpoint_path=bad_ckpt, in_channels=1, out_channels=2)
+
+
+def test_extract_state_dict_helper() -> None:
+    """Validate extract_state_dict normalizes various dictionary keys and handles errors."""
+    dummy_model = build_3d_unet(1, 2)
+    target_keys = list(dummy_model.state_dict().keys())
+
+    # Invalid payload type
+    with pytest.raises(ValueError, match="Unexpected checkpoint payload type"):
+        extract_state_dict("not_a_valid_checkpoint", target_keys)
+
+    # Bare tensor dictionary without model. prefix
+    stripped_dict = {k.removeprefix("model."): v for k, v in dummy_model.state_dict().items()}
+    cleaned = extract_state_dict(stripped_dict, target_keys)
+    assert set(cleaned.keys()) == set(target_keys)
+
+    # Sub-dict with non-tensor values ignored
+    metadata_dict = {"state_dict": dummy_model.state_dict(), "epoch": 5, "optimizer": {}}
+    cleaned_meta = extract_state_dict(metadata_dict, target_keys)
+    assert set(cleaned_meta.keys()) == set(target_keys)
 
 
 
