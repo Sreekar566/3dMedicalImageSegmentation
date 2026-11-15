@@ -14,6 +14,8 @@ import numpy as np
 import pydicom
 import SimpleITK as sitk
 
+from medical_segmentation.config import validate_orientation_code
+
 logger = logging.getLogger(__name__)
 
 
@@ -100,6 +102,10 @@ class VolumetricMetadata:
         Returns:
             Tuple of physical coordinates (px, py, pz) in millimeters.
         """
+        if len(continuous_index) != 3:
+            raise ValueError(
+                f"continuous_index must contain exactly 3 coordinates (cx, cy, cz), got {len(continuous_index)}."
+            )
         cx, cy, cz = continuous_index
         dx, dy, dz = self.spacing
         ox, oy, oz = self.origin
@@ -129,11 +135,11 @@ class DicomVolumeLoader:
             target_orientation: Standard 3-letter anatomical coordinate code (e.g., 'RAS' or 'LPS').
                                 'RAS': Right-to-Left, Anterior-to-Posterior, Superior-to-Inferior.
         """
-        self.target_orientation = target_orientation.upper()
+        self.target_orientation = validate_orientation_code(target_orientation)
 
     def load_dicom_series(
         self,
-        directory_path: Path,
+        directory_path: Path | str,
         series_id: Optional[str] = None,
     ) -> Tuple[sitk.Image, VolumetricMetadata]:
         """
@@ -147,27 +153,28 @@ class DicomVolumeLoader:
         Returns:
             Tuple of (Standardized sitk.Image in target orientation, VolumetricMetadata).
         """
-        if not directory_path.is_dir():
-            raise FileNotFoundError(f"DICOM series directory not found: {directory_path}")
+        dir_path = Path(directory_path).resolve()
+        if not dir_path.is_dir():
+            raise FileNotFoundError(f"DICOM series directory not found: {dir_path}")
 
-        logger.info("Scanning directory '%s' for DICOM series...", directory_path)
+        logger.info("Scanning directory '%s' for DICOM series...", dir_path)
         series_reader = sitk.ImageSeriesReader()
-        series_ids = series_reader.GetGDCMSeriesIDs(str(directory_path))
+        series_ids = series_reader.GetGDCMSeriesIDs(str(dir_path))
 
         if not series_ids:
             # Fallback: check if directory contains individual DICOM files directly
-            dcm_files = sorted(list(directory_path.glob("*.dcm")) + list(directory_path.glob("*.DCM")))
+            dcm_files = sorted(list(dir_path.glob("*.dcm")) + list(dir_path.glob("*.DCM")))
             if not dcm_files:
-                raise ValueError(f"No valid DICOM series or .dcm files found in: {directory_path}")
+                raise ValueError(f"No valid DICOM series or .dcm files found in: {dir_path}")
             logger.info("Directly reading %d DICOM files...", len(dcm_files))
             file_names = [str(f) for f in dcm_files]
         else:
             selected_series_id = series_id or series_ids[0]
             logger.info("Found %d series. Loading series ID: '%s'", len(series_ids), selected_series_id)
-            file_names = series_reader.GetGDCMSeriesFileNames(str(directory_path), selected_series_id)
+            file_names = series_reader.GetGDCMSeriesFileNames(str(dir_path), selected_series_id)
 
         if not file_names:
-            raise ValueError(f"Could not retrieve DICOM slice filenames from: {directory_path}")
+            raise ValueError(f"Could not retrieve DICOM slice filenames from: {dir_path}")
 
         # 1. Extract clinical tags from the first slice using pydicom
         metadata = self._extract_pydicom_metadata(Path(file_names[0]))
@@ -189,7 +196,7 @@ class DicomVolumeLoader:
         )
         return oriented_volume, metadata
 
-    def load_volume_file(self, file_path: Path) -> Tuple[sitk.Image, VolumetricMetadata]:
+    def load_volume_file(self, file_path: Path | str) -> Tuple[sitk.Image, VolumetricMetadata]:
         """
         Load a single 3D volumetric file (e.g. .nii, .nii.gz, .mha, or multi-frame .dcm).
 
@@ -199,16 +206,17 @@ class DicomVolumeLoader:
         Returns:
             Tuple of (Oriented sitk.Image, VolumetricMetadata).
         """
-        if not file_path.is_file():
-            raise FileNotFoundError(f"Volume file not found: {file_path}")
+        target_file = Path(file_path).resolve()
+        if not target_file.is_file():
+            raise FileNotFoundError(f"Volume file not found: {target_file}")
 
-        logger.info("Reading 3D volumetric file: '%s'", file_path)
-        raw_volume = sitk.ReadImage(str(file_path))
+        logger.info("Reading 3D volumetric file: '%s'", target_file)
+        raw_volume = sitk.ReadImage(str(target_file))
 
         metadata = VolumetricMetadata(
-            study_instance_uid=file_path.stem,
-            series_instance_uid=file_path.name,
-            modality="CT" if "ct" in file_path.name.lower() else "MRI",
+            study_instance_uid=target_file.stem,
+            series_instance_uid=target_file.name,
+            modality="CT" if "ct" in target_file.name.lower() else "MRI",
         )
 
         # Orient volume and populate physical coordinate geometry
@@ -285,7 +293,7 @@ class DicomVolumeLoader:
     def save_mask_as_nifti(
         mask_array: np.ndarray,
         reference_image: sitk.Image,
-        output_path: Path,
+        output_path: Path | str,
     ) -> Path:
         """
         Save a 3D segmentation mask (NumPy array) back to a NIfTI (.nii.gz) file,
@@ -300,12 +308,27 @@ class DicomVolumeLoader:
         Returns:
             The resolved Path to the saved file.
         """
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if not isinstance(mask_array, np.ndarray):
+            raise TypeError(f"mask_array must be a numpy ndarray, got {type(mask_array).__name__}.")
+        if mask_array.ndim != 3:
+            raise ValueError(f"mask_array must be 3-dimensional (Z, Y, X), got {mask_array.ndim} dimensions.")
+        if not isinstance(reference_image, sitk.Image):
+            raise TypeError(f"reference_image must be a SimpleITK Image, got {type(reference_image).__name__}.")
+
+        ref_size = reference_image.GetSize()  # (X, Y, Z)
+        expected_shape = (ref_size[2], ref_size[1], ref_size[0])  # (Z, Y, X)
+        if mask_array.shape != expected_shape:
+            raise ValueError(
+                f"mask_array shape {mask_array.shape} does not match reference image shape {expected_shape}."
+            )
+
+        resolved_output = Path(output_path).resolve()
+        resolved_output.parent.mkdir(parents=True, exist_ok=True)
         mask_sitk = sitk.GetImageFromArray(mask_array.astype(np.uint8))
         mask_sitk.SetSpacing(reference_image.GetSpacing())
         mask_sitk.SetOrigin(reference_image.GetOrigin())
         mask_sitk.SetDirection(reference_image.GetDirection())
 
-        logger.info("Writing 3D segmentation mask to: %s", output_path)
-        sitk.WriteImage(mask_sitk, str(output_path), True)  # True = compression enabled
-        return output_path
+        logger.info("Writing 3D segmentation mask to: %s", resolved_output)
+        sitk.WriteImage(mask_sitk, str(resolved_output), True)  # True = compression enabled
+        return resolved_output

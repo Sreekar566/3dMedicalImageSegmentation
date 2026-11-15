@@ -11,9 +11,17 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 import torch
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 
-from medical_segmentation.config import DatabaseSettings, InferenceSettings, PipelineConfig
+from medical_segmentation.config import (
+    AzureStorageSettings,
+    DatabaseSettings,
+    InferenceSettings,
+    PipelineConfig,
+    validate_azure_container_name,
+    validate_orientation_code,
+)
 from medical_segmentation.db.database import DatabaseManager, chunked_iterable
 from medical_segmentation.io.dicom_loader import DicomVolumeLoader, VolumetricMetadata
 from medical_segmentation.main import run_pipeline
@@ -766,6 +774,301 @@ def test_volumetric_metrics_calculator_decoupled_helpers() -> None:
     summary, counts = calc._compute_label_summary_with_counts(np.zeros((5, 5, 5), dtype=np.float32), empty_mask, 1, meta)
     assert summary is None
     assert counts is None
+
+
+def test_config_settings_validation_and_parsing(tmp_path: Path) -> None:
+    """Verify input validation and configuration parsing across Inference, DB, and Azure settings."""
+    # 1. InferenceSettings: roi_size parsing and validation
+    cfg = InferenceSettings(roi_size="(96, 96, 96)")
+    assert cfg.roi_size == (96, 96, 96)
+    assert InferenceSettings(roi_size="[64, 64, 64]").roi_size == (64, 64, 64)
+    assert InferenceSettings(roi_size="32, 32, 32").roi_size == (32, 32, 32)
+    assert InferenceSettings(roi_size=(48, 48, 48)).roi_size == (48, 48, 48)
+
+    with pytest.raises(ValueError, match="strictly positive integers"):
+        InferenceSettings(roi_size=(0, 96, 96))
+    with pytest.raises(ValueError, match="strictly positive integers"):
+        InferenceSettings(roi_size=(-5, 96, 96))
+    with pytest.raises(ValueError, match="exactly 3 dimensions"):
+        InferenceSettings(roi_size=(96, 96))
+    with pytest.raises(ValueError, match="comma-separated integers"):
+        InferenceSettings(roi_size="invalid")
+
+    # 2. InferenceSettings: target_spacing parsing and validation
+    assert InferenceSettings(target_spacing=None).target_spacing is None
+    assert InferenceSettings(target_spacing="").target_spacing is None
+    assert InferenceSettings(target_spacing="none").target_spacing is None
+    assert InferenceSettings(target_spacing="null").target_spacing is None
+    assert InferenceSettings(target_spacing="(1.0, 1.0, 1.0)").target_spacing == (1.0, 1.0, 1.0)
+    assert InferenceSettings(target_spacing="1.5, 1.5, 2.0").target_spacing == (1.5, 1.5, 2.0)
+
+    with pytest.raises(ValueError, match="strictly positive"):
+        InferenceSettings(target_spacing=(1.0, 0.0, 1.0))
+    with pytest.raises(ValueError, match="strictly positive"):
+        InferenceSettings(target_spacing=(-1.0, 1.0, 1.0))
+    with pytest.raises(ValueError, match="exactly 3 dimensions"):
+        InferenceSettings(target_spacing=(1.0, 1.0))
+    with pytest.raises(ValueError, match="comma-separated floats"):
+        InferenceSettings(target_spacing="invalid")
+
+    # 3. InferenceSettings: model_checkpoint_path normalization
+    assert InferenceSettings(model_checkpoint_path=None).model_checkpoint_path is None
+    assert InferenceSettings(model_checkpoint_path="").model_checkpoint_path is None
+    assert InferenceSettings(model_checkpoint_path="none").model_checkpoint_path is None
+    assert InferenceSettings(model_checkpoint_path="null").model_checkpoint_path is None
+    assert InferenceSettings(model_checkpoint_path=Path("")).model_checkpoint_path is None
+    assert InferenceSettings(model_checkpoint_path=Path(".")).model_checkpoint_path is None
+    assert InferenceSettings(model_checkpoint_path=Path("ckpt.pt")).model_checkpoint_path == Path("ckpt.pt")
+    assert InferenceSettings(model_checkpoint_path="/tmp/ckpt.pt").model_checkpoint_path == Path("/tmp/ckpt.pt")
+
+    # 4. InferenceSettings: modality normalization & validation
+    assert InferenceSettings(modality="ct").modality == "CT"
+    assert InferenceSettings(modality="mri").modality == "MRI"
+    assert InferenceSettings(modality="cbct").modality == "CBCT"
+    with pytest.raises(ValidationError):
+        InferenceSettings(modality="PET")
+
+    # 5. InferenceSettings: device validation
+    assert InferenceSettings(device="cpu").device == "cpu"
+    with pytest.raises(ValueError, match="Invalid PyTorch execution device"):
+        InferenceSettings(device="not_a_device_type")
+    with pytest.raises((TypeError, ValidationError)):
+        InferenceSettings(device=123)
+
+    # 6. InferenceSettings: numeric range validation
+    with pytest.raises(ValidationError):
+        InferenceSettings(sw_batch_size=0)
+    with pytest.raises(ValidationError):
+        InferenceSettings(in_channels=0)
+    with pytest.raises(ValidationError):
+        InferenceSettings(out_channels=0)
+    with pytest.raises(ValidationError):
+        InferenceSettings(overlap=-0.1)
+    with pytest.raises(ValidationError):
+        InferenceSettings(overlap=0.9)
+
+    # 7. DatabaseSettings: port and batch size validation
+    assert DatabaseSettings(port=5432).port == 5432
+    with pytest.raises(ValidationError):
+        DatabaseSettings(port=0)
+    with pytest.raises(ValidationError):
+        DatabaseSettings(port=70000)
+    with pytest.raises(ValidationError):
+        DatabaseSettings(batch_size=0)
+    with pytest.raises(ValidationError):
+        DatabaseSettings(pool_size=0)
+    with pytest.raises(ValidationError):
+        DatabaseSettings(max_overflow=-1)
+    with pytest.raises(ValidationError):
+        DatabaseSettings(pool_timeout=0)
+
+    # 8. DatabaseSettings: connection_url special characters encoding
+    db_special = DatabaseSettings(
+        user="special@user",
+        password="p@ss:w/ord#1",
+        host="myhost",
+        port=5432,
+        name="test_db",
+        sslmode="require",
+    )
+    url = db_special.connection_url
+    assert "special%40user" in url
+    assert "p%40ss%3Aw%2Ford%231" in url
+    assert url.startswith("postgresql+psycopg2://special%40user:p%40ss%3Aw%2Ford%231@myhost:5432/test_db?sslmode=require")
+
+    # 9. AzureStorageSettings: container name and concurrency validation
+    assert AzureStorageSettings(input_container="valid-input-1").input_container == "valid-input-1"
+    with pytest.raises(ValidationError):
+        AzureStorageSettings(input_container="INVALID_UPPERCASE")
+    with pytest.raises(ValidationError):
+        AzureStorageSettings(input_container="in--valid")
+    with pytest.raises(ValidationError):
+        AzureStorageSettings(input_container="-invalid")
+    with pytest.raises(ValidationError):
+        AzureStorageSettings(input_container="invalid-")
+    with pytest.raises(ValidationError):
+        AzureStorageSettings(input_container="ab")
+    with pytest.raises(ValidationError):
+        AzureStorageSettings(max_concurrency=0)
+    with pytest.raises(ValidationError):
+        AzureStorageSettings(timeout_seconds=0)
+
+    # 10. PipelineConfig: log level and work_dir validation
+    cfg_pipe = PipelineConfig(log_level="debug", work_dir="/tmp/test_dir")
+    assert cfg_pipe.log_level == "DEBUG"
+    assert cfg_pipe.work_dir == Path("/tmp/test_dir")
+    cfg_warn = PipelineConfig(log_level="warn")
+    assert cfg_warn.log_level == "WARNING"
+    with pytest.raises(ValidationError):
+        PipelineConfig(log_level="VERBOSE")
+    with pytest.raises(ValidationError):
+        PipelineConfig(work_dir="")
+
+
+def test_strict_anatomical_orientation_validation() -> None:
+    """Verify strict 3-orthogonal-axis permutation validation for DICOM spatial orientations."""
+    # Valid 3D orientations (permutations of {R, L}, {A, P}, {S, I})
+    valid_codes = ["RAS", "LPS", "PIR", "ASR", "RSP", "LPI", "IPL", "SRA"]
+    for code in valid_codes:
+        assert validate_orientation_code(code) == code
+        assert validate_orientation_code(code.lower()) == code
+        cfg = InferenceSettings(target_orientation=code.lower())
+        assert cfg.target_orientation == code
+        loader = DicomVolumeLoader(target_orientation=code.lower())
+        assert loader.target_orientation == code
+
+    # Invalid orientations: duplicate axes or opposing directions
+    invalid_codes = ["RRR", "RLP", "SSS", "AAP", "XYZ", "INVALID", "RA", "RASS", "123", ""]
+    for inv in invalid_codes:
+        with pytest.raises(ValueError):
+            validate_orientation_code(inv)
+        with pytest.raises(ValueError):
+            InferenceSettings(target_orientation=inv)
+        with pytest.raises(ValueError):
+            DicomVolumeLoader(target_orientation=inv)
+
+    with pytest.raises(TypeError):
+        validate_orientation_code(None)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        DicomVolumeLoader(target_orientation=123)  # type: ignore[arg-type]
+
+
+def test_continuous_index_validation() -> None:
+    """Verify continuous_index_to_physical_point validates coordinate tuple length."""
+    meta = VolumetricMetadata(spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0))
+    assert meta.continuous_index_to_physical_point((1.0, 2.0, 3.0)) == (1.0, 2.0, 3.0)
+
+    with pytest.raises(ValueError, match="must contain exactly 3 coordinates"):
+        meta.continuous_index_to_physical_point((1.0, 2.0))
+
+    with pytest.raises(ValueError, match="must contain exactly 3 coordinates"):
+        meta.continuous_index_to_physical_point((1.0, 2.0, 3.0, 4.0))
+
+
+def test_save_mask_as_nifti_input_validation(tmp_path: Path) -> None:
+    """Verify save_mask_as_nifti validates mask array type, dimensions, and reference shape."""
+    ref_arr = np.zeros((10, 20, 30), dtype=np.float32)
+    ref_img = sitk.GetImageFromArray(ref_arr)
+    valid_mask = np.zeros((10, 20, 30), dtype=np.uint8)
+    out_file = tmp_path / "valid_mask.nii.gz"
+
+    # Valid save
+    saved = DicomVolumeLoader.save_mask_as_nifti(valid_mask, ref_img, out_file)
+    assert saved.is_file()
+
+    # Mismatched shape
+    mismatched_mask = np.zeros((10, 20, 25), dtype=np.uint8)
+    with pytest.raises(ValueError, match="does not match reference image shape"):
+        DicomVolumeLoader.save_mask_as_nifti(mismatched_mask, ref_img, tmp_path / "err.nii.gz")
+
+    # Non-3D mask
+    with pytest.raises(ValueError, match="must be 3-dimensional"):
+        DicomVolumeLoader.save_mask_as_nifti(np.zeros((10, 20), dtype=np.uint8), ref_img, tmp_path / "err.nii.gz")
+
+    # Non-ndarray mask
+    with pytest.raises(TypeError, match="must be a numpy ndarray"):
+        DicomVolumeLoader.save_mask_as_nifti([1, 2, 3], ref_img, tmp_path / "err.nii.gz")  # type: ignore[arg-type]
+
+    # Non-sitk reference image
+    with pytest.raises(TypeError, match="must be a SimpleITK Image"):
+        DicomVolumeLoader.save_mask_as_nifti(valid_mask, "not_an_image", tmp_path / "err.nii.gz")  # type: ignore[arg-type]
+
+
+def test_volumetric_metrics_calculator_array_validation() -> None:
+    """Verify VolumetricMetricsCalculator.validate_arrays catches dimension and empty array errors."""
+    calc = VolumetricMetricsCalculator()
+    valid_arr = np.ones((8, 8, 8), dtype=np.float32)
+    calc.validate_arrays(valid_arr, valid_arr)
+
+    # 2D array
+    with pytest.raises(ValueError, match="Expected 3D volumetric arrays"):
+        calc.validate_arrays(np.ones((8, 8)), np.ones((8, 8)))
+
+    # 4D array
+    with pytest.raises(ValueError, match="Expected 3D volumetric arrays"):
+        calc.validate_arrays(np.ones((1, 8, 8, 8)), np.ones((1, 8, 8, 8)))
+
+    # Empty array
+    with pytest.raises(ValueError, match="Arrays cannot be empty"):
+        calc.validate_arrays(np.zeros((0, 0, 0)), np.zeros((0, 0, 0)))
+
+    # Non-ndarray
+    with pytest.raises(TypeError, match="must be numpy ndarrays"):
+        calc.validate_arrays([1, 2], [1, 2])  # type: ignore[arg-type]
+
+
+def test_sliding_window_inference_tensor_validation() -> None:
+    """Verify SlidingWindowInferenceEngine.execute_inference validates tensor rank, batch size, and dimensions."""
+    settings = InferenceSettings(roi_size=(8, 8, 8), device="cpu")
+    model = build_3d_unet(in_channels=1, out_channels=2, channels=(4, 8), strides=(2,), num_res_units=1)
+    engine = SlidingWindowInferenceEngine(model=model, settings=settings)
+
+    # Non-tensor
+    with pytest.raises(TypeError, match="volume_tensor must be a torch.Tensor"):
+        engine.execute_inference(np.zeros((1, 1, 8, 8, 8)))  # type: ignore[arg-type]
+
+    # 4D tensor (missing batch or channel)
+    with pytest.raises(ValueError, match="Expected 5D volume tensor"):
+        engine.execute_inference(torch.zeros((1, 8, 8, 8)))
+
+    # Batch size > 1
+    with pytest.raises(ValueError, match="Expected batch size 1"):
+        engine.execute_inference(torch.zeros((2, 1, 8, 8, 8)))
+
+    # Non-positive dimension
+    with pytest.raises(ValueError, match="dimensions must be strictly positive"):
+        engine.execute_inference(torch.zeros((1, 1, 0, 8, 8)))
+
+
+def test_chunked_iterable_negative_or_zero_chunk_size() -> None:
+    """Verify chunked_iterable raises ValueError for non-positive chunk sizes."""
+    with pytest.raises(ValueError, match="strictly positive integer"):
+        list(chunked_iterable([1, 2, 3], chunk_size=0))
+
+    with pytest.raises(ValueError, match="strictly positive integer"):
+        list(chunked_iterable([1, 2, 3], chunk_size=-5))
+
+
+def test_main_run_pipeline_input_validation() -> None:
+    """Verify run_pipeline rejects invalid batch_size and orientation arguments with non-zero exit code."""
+    # Negative batch size
+    exit_code_batch = run_pipeline(batch_size=0)
+    assert exit_code_batch != 0
+
+    # Invalid orientation
+    exit_code_orient = run_pipeline(orientation="RRR")
+    assert exit_code_orient != 0
+
+
+def test_pipeline_config_dotenv_loading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify that .env configuration file seamlessly populates nested settings and parses complex types."""
+    dotenv_file = tmp_path / ".env"
+    dotenv_file.write_text(
+        """
+AZURE_STORAGE_MAX_CONCURRENCY=8
+AZURE_STORAGE_TIMEOUT_SECONDS=120
+DB_PORT=5433
+DB_HOST=my-custom-pg.postgres.database.azure.com
+INFERENCE_MODALITY="MRI"
+INFERENCE_ROI_SIZE="(64, 64, 64)"
+INFERENCE_TARGET_SPACING="(1.5, 1.5, 2.0)"
+INFERENCE_MODEL_CHECKPOINT_PATH=""
+LOG_LEVEL="DEBUG"
+"""
+    )
+    monkeypatch.chdir(tmp_path)
+    pipe_cfg = PipelineConfig()
+    assert pipe_cfg.azure.max_concurrency == 8
+    assert pipe_cfg.azure.timeout_seconds == 120
+    assert pipe_cfg.db.port == 5433
+    assert pipe_cfg.db.host == "my-custom-pg.postgres.database.azure.com"
+    assert pipe_cfg.inference.modality == "MRI"
+    assert pipe_cfg.inference.roi_size == (64, 64, 64)
+    assert pipe_cfg.inference.target_spacing == (1.5, 1.5, 2.0)
+    assert pipe_cfg.inference.model_checkpoint_path is None
+    assert pipe_cfg.log_level == "DEBUG"
+
+
 
 
 

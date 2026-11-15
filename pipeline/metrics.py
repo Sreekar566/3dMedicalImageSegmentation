@@ -51,11 +51,20 @@ class VolumetricMetricsCalculator:
 
     def validate_arrays(self, raw_array: np.ndarray, mask_array: np.ndarray) -> None:
         """Validate array dimensions and compatibility."""
+        if not isinstance(raw_array, np.ndarray) or not isinstance(mask_array, np.ndarray):
+            raise TypeError("Both raw_array and mask_array must be numpy ndarrays.")
+        if raw_array.ndim != 3 or mask_array.ndim != 3:
+            raise ValueError(
+                f"Expected 3D volumetric arrays (Z, Y, X), but got raw_array.ndim={raw_array.ndim} "
+                f"and mask_array.ndim={mask_array.ndim}."
+            )
         if raw_array.shape != mask_array.shape:
             raise ValueError(
                 f"Array shape mismatch: raw_array shape {raw_array.shape} "
                 f"does not match mask_array shape {mask_array.shape}."
             )
+        if raw_array.size == 0:
+            raise ValueError("Arrays cannot be empty (size 0).")
 
     def _compute_intensity_statistics(
         self,

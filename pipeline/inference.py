@@ -58,6 +58,22 @@ class SlidingWindowInferenceEngine:
         Returns:
             Discretized 3D integer label map array of shape (D, H, W).
         """
+        if not isinstance(volume_tensor, torch.Tensor):
+            raise TypeError(f"volume_tensor must be a torch.Tensor, got {type(volume_tensor).__name__}.")
+        if volume_tensor.ndim != 5:
+            raise ValueError(
+                f"Expected 5D volume tensor of shape (1, C, D, H, W), got {volume_tensor.ndim}D tensor "
+                f"with shape {tuple(volume_tensor.shape)}."
+            )
+        if volume_tensor.shape[0] != 1:
+            raise ValueError(
+                f"Expected batch size 1 for sliding-window inference, got {volume_tensor.shape[0]}."
+            )
+        if any(dim <= 0 for dim in volume_tensor.shape):
+            raise ValueError(
+                f"Volume tensor dimensions must be strictly positive, got shape {tuple(volume_tensor.shape)}."
+            )
+
         logger.info(
             "Executing 3D sliding-window inference: roi_size=%s, sw_batch_size=%d, overlap=%.2f, mode='gaussian'",
             self.settings.roi_size,

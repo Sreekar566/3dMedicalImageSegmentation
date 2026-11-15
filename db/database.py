@@ -42,6 +42,8 @@ def chunked_iterable(iterable: Iterable[Any], chunk_size: int = 500) -> Generato
     Yields:
         Lists of up to chunk_size items.
     """
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be a strictly positive integer, got {chunk_size}.")
     iterator = iter(iterable)
     while True:
         chunk = list(itertools.islice(iterator, chunk_size))
@@ -207,6 +209,8 @@ class DatabaseManager:
             Total number of slice metric rows successfully persisted.
         """
         effective_batch_size = batch_size or self.settings.batch_size
+        if effective_batch_size <= 0:
+            raise ValueError(f"batch_size must be a strictly positive integer, got {effective_batch_size}.")
         logger.info(
             "Beginning chunked batched insert for run_id=%d (batch_size=%d rows/chunk)...",
             run_id,

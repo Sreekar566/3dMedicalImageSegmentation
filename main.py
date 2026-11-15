@@ -20,7 +20,7 @@ if "medical_segmentation" not in sys.modules:
     med_pkg.__path__ = [str(Path(__file__).resolve().parent)]
     sys.modules["medical_segmentation"] = med_pkg
 
-from medical_segmentation.config import config
+from medical_segmentation.config import config, validate_orientation_code
 from medical_segmentation.pipeline import PipelineOrchestrator, PipelineResult
 
 logging.basicConfig(
@@ -118,6 +118,9 @@ def run_pipeline(
         Exit code: 0 on success, non-zero on error.
     """
     try:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be a strictly positive integer, got {batch_size}.")
+        orientation = validate_orientation_code(orientation)
         orchestrator = PipelineOrchestrator(config=config)
         orchestrator.run(
             blob_path=blob_path,

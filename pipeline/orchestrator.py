@@ -17,7 +17,11 @@ import numpy as np
 import SimpleITK as sitk
 import torch
 
-from medical_segmentation.config import PipelineConfig, config as default_config
+from medical_segmentation.config import (
+    PipelineConfig,
+    config as default_config,
+    validate_orientation_code,
+)
 from medical_segmentation.io.azure_client import AzureBlobClient
 from medical_segmentation.io.dicom_loader import DicomVolumeLoader, VolumetricMetadata
 from medical_segmentation.pipeline.inference import SlidingWindowInferenceEngine
@@ -145,7 +149,9 @@ class PipelineOrchestrator:
         """
         Step 2: Load volume and standardize spatial orientation via sitk.DICOMOrient.
         """
-        target_orientation = orientation or self.config.inference.target_orientation
+        target_orientation = validate_orientation_code(
+            orientation or self.config.inference.target_orientation
+        )
         if target_orientation != self.volume_loader.target_orientation:
             self.volume_loader = DicomVolumeLoader(target_orientation=target_orientation)
 
@@ -303,6 +309,8 @@ class PipelineOrchestrator:
             return None, None, 0
 
         effective_batch_size = batch_size or self.config.db.batch_size
+        if effective_batch_size <= 0:
+            raise ValueError(f"batch_size must be a positive integer, got {effective_batch_size}")
         try:
             if self.db_manager is not None:
                 db = self.db_manager
