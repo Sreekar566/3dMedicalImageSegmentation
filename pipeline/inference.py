@@ -73,6 +73,11 @@ class SlidingWindowInferenceEngine:
             raise ValueError(
                 f"Volume tensor dimensions must be strictly positive, got shape {tuple(volume_tensor.shape)}."
             )
+        if volume_tensor.shape[1] != self.settings.in_channels:
+            raise ValueError(
+                f"Expected volume tensor with {self.settings.in_channels} channel(s), "
+                f"got {volume_tensor.shape[1]} channel(s)."
+            )
 
         logger.info(
             "Executing 3D sliding-window inference: roi_size=%s, sw_batch_size=%d, overlap=%.2f, mode='gaussian'",

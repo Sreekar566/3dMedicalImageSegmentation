@@ -8,6 +8,7 @@ extraction, NIfTI mask serialization, and chunked database persistence.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,7 +69,7 @@ class PipelineOrchestrator:
         db_manager: Optional[DatabaseManager] = None,
         inference_engine: Optional[SlidingWindowInferenceEngine] = None,
         metrics_calculator: Optional[VolumetricMetricsCalculator] = None,
-        workspace: Optional[Path] = None,
+        workspace: Optional[Path | str] = None,
     ):
         self.config = config or default_config
         self.azure_client = azure_client or AzureBlobClient(self.config.azure)
@@ -78,14 +79,14 @@ class PipelineOrchestrator:
         self.db_manager = db_manager
         self.inference_engine = inference_engine
         self.metrics_calculator = metrics_calculator or VolumetricMetricsCalculator()
-        self.workspace = workspace or self.config.work_dir
+        self.workspace = Path(workspace or self.config.work_dir).resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
 
     def ingest_volume(
         self,
         blob_path: Optional[str] = None,
         series_prefix: Optional[str] = None,
-        local_input: Optional[Path] = None,
+        local_input: Optional[Path | str] = None,
         input_container: Optional[str] = None,
     ) -> Tuple[Path, bool]:
         """
@@ -192,7 +193,7 @@ class PipelineOrchestrator:
     def execute_inference(
         self,
         volume_tensor: torch.Tensor,
-        checkpoint: Optional[Path] = None,
+        checkpoint: Optional[Path | str] = None,
     ) -> Tuple[np.ndarray, float]:
         """
         Step 4: Load 3D U-Net and execute sliding-window volumetric inference.
@@ -265,7 +266,8 @@ class PipelineOrchestrator:
         Returns:
             Tuple of (local_mask_path, output_blob_uri).
         """
-        mask_filename = f"mask_{metadata.study_instance_uid or 'run'}_{int(time.time())}.nii.gz"
+        clean_uid = re.sub(r"[^\w\-.]", "_", metadata.study_instance_uid or "run")
+        mask_filename = f"mask_{clean_uid}_{int(time.time())}.nii.gz"
         local_mask_path = self.workspace / "outputs" / mask_filename
 
         DicomVolumeLoader.save_mask_as_nifti(
@@ -345,12 +347,12 @@ class PipelineOrchestrator:
         self,
         blob_path: Optional[str] = None,
         series_prefix: Optional[str] = None,
-        local_input: Optional[Path] = None,
+        local_input: Optional[Path | str] = None,
         input_container: Optional[str] = None,
         output_container: Optional[str] = None,
         modality: str = "CT",
         orientation: Optional[str] = None,
-        checkpoint: Optional[Path] = None,
+        checkpoint: Optional[Path | str] = None,
         batch_size: Optional[int] = None,
         dry_run: bool = False,
     ) -> PipelineResult:
@@ -358,7 +360,9 @@ class PipelineOrchestrator:
         Execute end-to-end 3D medical segmentation workflow across all 7 stages.
         """
         total_start = time.perf_counter()
-        target_orientation = orientation or self.config.inference.target_orientation
+        target_orientation = validate_orientation_code(
+            orientation or self.config.inference.target_orientation
+        )
 
         logger.info("=== Step 1: Volume Ingestion ===")
         target_path, is_dicom_dir = self.ingest_volume(

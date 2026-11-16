@@ -840,3 +840,34 @@ def test_dicom_volume_loader_save_mask_as_nifti_large_label_dtype(tmp_path: Path
     assert loaded_arr[1, 1, 1] == 300
     assert np.array_equal(loaded_arr, mask_arr)
 
+
+def test_azure_client_string_path_support(tmp_path: Path) -> None:
+    """Verify download_blob_to_file, download_series_prefix, and upload_file_to_blob accept str paths."""
+    client, mock_bsc = _make_connected_client()
+    mock_cc = MagicMock()
+    mock_bc = MagicMock()
+    mock_bsc.get_container_client.return_value = mock_cc
+    mock_cc.get_blob_client.return_value = mock_bc
+
+    # download_blob_to_file with str path
+    str_dest = str(tmp_path / "str_dest" / "vol.nii.gz")
+    res = client.download_blob_to_file("med-container", "vol.nii.gz", str_dest)
+    assert isinstance(res, Path)
+    assert res == Path(str_dest).resolve()
+
+    # download_series_prefix with str dir
+    mock_blob = MagicMock()
+    mock_blob.name = "series/slice_01.dcm"
+    mock_cc.list_blobs.return_value = [mock_blob]
+    str_dir = str(tmp_path / "str_series")
+    downloaded = client.download_series_prefix("med-container", "series/", str_dir)
+    assert len(downloaded) == 1
+    assert isinstance(downloaded[0], Path)
+
+    # upload_file_to_blob with str path
+    dummy_file = tmp_path / "upload_target.nii.gz"
+    dummy_file.write_bytes(b"DATA")
+    mock_bc.url = "https://mock.blob.core.windows.net/med-container/upload_target.nii.gz"
+    url = client.upload_file_to_blob("med-container", "upload_target.nii.gz", str(dummy_file))
+    assert url == mock_bc.url
+

@@ -1182,3 +1182,141 @@ def test_main_entrypoint(monkeypatch: pytest.MonkeyPatch) -> None:
             )
 
 
+def test_prepare_tensor_from_sitk_input_validation() -> None:
+    """Verify prepare_tensor_from_sitk validates image type, dimensionality, empty voxels, modality, spacing, and device."""
+    valid_arr = np.zeros((8, 8, 8), dtype=np.float32)
+    valid_img = sitk.GetImageFromArray(valid_arr)
+
+    # 1. Non-sitk image
+    with pytest.raises(TypeError, match="image must be a SimpleITK Image"):
+        prepare_tensor_from_sitk(image="not_an_image")  # type: ignore[arg-type]
+
+    # 2. 2D SimpleITK image
+    img_2d = sitk.GetImageFromArray(np.zeros((8, 8), dtype=np.float32))
+    with pytest.raises(ValueError, match="Expected 3D SimpleITK image"):
+        prepare_tensor_from_sitk(image=img_2d)
+
+    # 3. Non-string modality
+    with pytest.raises(TypeError, match="modality must be a string"):
+        prepare_tensor_from_sitk(image=valid_img, modality=123)  # type: ignore[arg-type]
+
+    # 4. Empty string modality
+    with pytest.raises(ValueError, match="modality cannot be empty"):
+        prepare_tensor_from_sitk(image=valid_img, modality="   ")
+
+    # 5. Invalid target_spacing (non-positive or wrong dimension)
+    with pytest.raises(ValueError, match="Target spacing dimensions must be strictly positive"):
+        prepare_tensor_from_sitk(image=valid_img, target_spacing=(1.0, -1.0, 1.0))
+
+    # 6. Invalid PyTorch device
+    with pytest.raises(ValueError, match="Invalid PyTorch execution device"):
+        prepare_tensor_from_sitk(image=valid_img, device="invalid_device_name_xyz")
+
+    with pytest.raises(TypeError, match="device must be a string or torch.device"):
+        prepare_tensor_from_sitk(image=valid_img, device=12345)  # type: ignore[arg-type]
+
+
+def test_build_volumetric_transforms_input_validation() -> None:
+    """Verify build_volumetric_transforms rejects invalid modality, spacing, and device inputs."""
+    # Non-string modality
+    with pytest.raises(TypeError, match="modality must be a string"):
+        build_volumetric_transforms(modality=None)  # type: ignore[arg-type]
+
+    # Empty modality
+    with pytest.raises(ValueError, match="modality cannot be empty"):
+        build_volumetric_transforms(modality="")
+
+    # Target spacing string parsing and validation
+    transform_from_str = build_volumetric_transforms(target_spacing="(1.5, 1.5, 2.0)")
+    assert transform_from_str is not None
+
+    with pytest.raises(ValueError, match="Target spacing"):
+        build_volumetric_transforms(target_spacing="invalid,spacing")
+
+    # Invalid device
+    with pytest.raises(ValueError, match="Invalid PyTorch execution device"):
+        build_volumetric_transforms(device="non_existent_device")
+
+
+def test_build_3d_unet_input_validation() -> None:
+    """Verify build_3d_unet validates hyperparameters including channels, strides, in/out channels, and dropout."""
+    # in_channels <= 0
+    with pytest.raises(ValueError, match="in_channels must be a strictly positive integer"):
+        build_3d_unet(in_channels=0)
+
+    # out_channels <= 0
+    with pytest.raises(ValueError, match="out_channels must be a strictly positive integer"):
+        build_3d_unet(out_channels=-1)
+
+    # num_res_units < 0
+    with pytest.raises(ValueError, match="num_res_units must be a non-negative integer"):
+        build_3d_unet(num_res_units=-2)
+
+    # dropout out of range [0.0, 1.0]
+    with pytest.raises(ValueError, match="dropout must be a float between 0.0 and 1.0"):
+        build_3d_unet(dropout=1.5)
+    with pytest.raises(ValueError, match="dropout must be a float between 0.0 and 1.0"):
+        build_3d_unet(dropout=-0.1)
+
+    # channels length < 2
+    with pytest.raises(ValueError, match="channels must contain at least 2 resolution levels"):
+        build_3d_unet(channels=[16], strides=[])
+
+    # non-positive channel dimensions
+    with pytest.raises(ValueError, match="All channel dimensions must be strictly positive"):
+        build_3d_unet(channels=[16, 0, 32], strides=[2, 2])
+
+    # strides length mismatch
+    with pytest.raises(ValueError, match="strides length"):
+        build_3d_unet(channels=[16, 32, 64], strides=[2])
+
+    # non-positive stride values
+    with pytest.raises(ValueError, match="All stride values must be strictly positive"):
+        build_3d_unet(channels=[16, 32], strides=[0])
+
+    # empty norm
+    with pytest.raises(ValueError, match="norm must be a non-empty string"):
+        build_3d_unet(norm="   ")
+
+
+def test_load_3d_unet_input_validation() -> None:
+    """Verify load_3d_unet validates device, normalizes empty string checkpoint paths, and catches invalid types."""
+    # Invalid device
+    with pytest.raises(ValueError, match="Invalid PyTorch execution device"):
+        load_3d_unet(device="invalid_dev")
+
+    with pytest.raises(TypeError, match="device must be a string or torch.device"):
+        load_3d_unet(device=999)  # type: ignore[arg-type]
+
+    # Empty string or "none" checkpoint path normalizes to None (returns fresh initialized model)
+    model_empty_str = load_3d_unet(checkpoint_path="")
+    assert model_empty_str is not None
+
+    model_none_str = load_3d_unet(checkpoint_path="none")
+    assert model_none_str is not None
+
+    # Invalid type for checkpoint_path
+    with pytest.raises(TypeError, match="checkpoint_path must be a Path, str, or None"):
+        load_3d_unet(checkpoint_path=[1, 2, 3])  # type: ignore[arg-type]
+
+
+def test_sliding_window_inference_channel_validation() -> None:
+    """Verify SlidingWindowInferenceEngine catches channel mismatches between input tensor and model configuration."""
+    settings = InferenceSettings(roi_size=(8, 8, 8), in_channels=1, out_channels=2, device="cpu")
+    model = build_3d_unet(in_channels=1, out_channels=2, channels=(4, 8), strides=(2,), num_res_units=1)
+    engine = SlidingWindowInferenceEngine(model=model, settings=settings)
+
+    # Input tensor has 3 channels but model expects 1
+    mismatched_tensor = torch.zeros((1, 3, 8, 8, 8), dtype=torch.float32)
+    with pytest.raises(ValueError, match="Expected volume tensor with 1 channel"):
+        engine.execute_inference(mismatched_tensor)
+
+
+def test_pipeline_orchestrator_workspace_str_handling(tmp_path: Path) -> None:
+    """Verify PipelineOrchestrator accepts workspace as a string and correctly creates staging directory."""
+    str_workspace = str(tmp_path / "custom_str_workspace")
+    orchestrator = PipelineOrchestrator(workspace=str_workspace)
+    assert isinstance(orchestrator.workspace, Path)
+    assert orchestrator.workspace.is_dir()
+
+
