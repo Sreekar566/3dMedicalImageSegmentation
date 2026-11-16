@@ -19,6 +19,59 @@ from medical_segmentation.config import validate_orientation_code
 logger = logging.getLogger(__name__)
 
 
+__all__ = [
+    "DicomVolumeLoader",
+    "VolumetricMetadata",
+    "safe_parse_float",
+    "safe_parse_str",
+]
+
+
+def safe_parse_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    """
+    Safely parse a DICOM header value into a float.
+    Handles None, empty strings, lists, tuples, pydicom MultiValue,
+    backslash-delimited strings, and conversion exceptions.
+    """
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple, Sequence)) and not isinstance(value, (str, bytes)):
+        if len(value) == 0:
+            return default
+        value = value[0]
+        if value is None:
+            return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, (str, bytes)):
+        clean = (value.decode("utf-8", errors="ignore") if isinstance(value, bytes) else value).strip()
+        if not clean or clean.lower() in ("none", "null"):
+            return default
+        if "\\" in clean:
+            clean = clean.split("\\")[0].strip()
+        try:
+            return float(clean)
+        except (ValueError, TypeError):
+            return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_parse_str(value: Any, default: str = "") -> str:
+    """
+    Safely parse a DICOM header value into a clean string.
+    Normalizes None, 'None', empty strings, and whitespace to default.
+    """
+    if value is None:
+        return default
+    s = str(value).strip()
+    if not s or s.lower() in ("none", "null"):
+        return default
+    return s
+
+
 @dataclass
 class VolumetricMetadata:
     """Standardized physical geometry and DICOM clinical metadata for a 3D medical volume."""
@@ -42,12 +95,16 @@ class VolumetricMetadata:
     @property
     def voxel_volume_mm3(self) -> float:
         """Physical volume of a single voxel in mm³."""
-        return float(self.spacing[0] * self.spacing[1] * self.spacing[2])
+        if len(self.spacing) >= 3:
+            return float(self.spacing[0] * self.spacing[1] * self.spacing[2])
+        return 1.0
 
     @property
     def pixel_area_slice_mm2(self) -> float:
         """Physical cross-sectional area of a single slice pixel (X-Y in voxel space) in mm²."""
-        return float(self.spacing[0] * self.spacing[1])
+        if len(self.spacing) >= 2:
+            return float(self.spacing[0] * self.spacing[1])
+        return 1.0
 
     @property
     def pixel_area_axial_mm2(self) -> float:
@@ -163,7 +220,8 @@ class DicomVolumeLoader:
 
         if not series_ids:
             # Fallback: check if directory contains individual DICOM files directly
-            dcm_files = sorted(list(dir_path.glob("*.dcm")) + list(dir_path.glob("*.DCM")))
+            # Deduplicate matching files for case-insensitive filesystems
+            dcm_files = sorted(set(list(dir_path.glob("*.dcm")) + list(dir_path.glob("*.DCM"))))
             if not dcm_files:
                 raise ValueError(f"No valid DICOM series or .dcm files found in: {dir_path}")
             logger.info("Directly reading %d DICOM files...", len(dcm_files))
@@ -213,11 +271,25 @@ class DicomVolumeLoader:
         logger.info("Reading 3D volumetric file: '%s'", target_file)
         raw_volume = sitk.ReadImage(str(target_file))
 
-        metadata = VolumetricMetadata(
-            study_instance_uid=target_file.stem,
-            series_instance_uid=target_file.name,
-            modality="CT" if "ct" in target_file.name.lower() else "MRI",
-        )
+        # Determine clean base identifier without archive extensions (.nii.gz -> base)
+        file_name_lower = target_file.name.lower()
+        if file_name_lower.endswith(".nii.gz"):
+            study_uid = target_file.name[:-7]
+        else:
+            study_uid = target_file.stem
+
+        if target_file.suffix.lower() in (".dcm", ".ima"):
+            metadata = self._extract_pydicom_metadata(target_file)
+            if not metadata.study_instance_uid:
+                metadata.study_instance_uid = study_uid
+            if not metadata.series_instance_uid:
+                metadata.series_instance_uid = target_file.name
+        else:
+            metadata = VolumetricMetadata(
+                study_instance_uid=study_uid,
+                series_instance_uid=target_file.name,
+                modality="CT" if "ct" in target_file.name.lower() else "MRI",
+            )
 
         # Orient volume and populate physical coordinate geometry
         oriented_volume, metadata = self._orient_and_populate_geometry(raw_volume, metadata)
@@ -247,24 +319,40 @@ class DicomVolumeLoader:
         """Parse DICOM header attributes from a slice using pydicom."""
         try:
             ds = pydicom.dcmread(sample_slice_path, stop_before_pixels=True)
-            patient_id = str(getattr(ds, "PatientID", "ANONYMOUS"))
-            study_uid = str(getattr(ds, "StudyInstanceUID", ""))
-            series_uid = str(getattr(ds, "SeriesInstanceUID", ""))
-            modality = str(getattr(ds, "Modality", "CT")).upper()
-            body_part = str(getattr(ds, "BodyPartExamined", "HEAD_NECK"))
+            patient_id = safe_parse_str(getattr(ds, "PatientID", None), "ANONYMOUS")
+            study_uid = safe_parse_str(getattr(ds, "StudyInstanceUID", None), "")
+            series_uid = safe_parse_str(getattr(ds, "SeriesInstanceUID", None), "")
+            modality = safe_parse_str(getattr(ds, "Modality", None), "CT").upper()
+            body_part = safe_parse_str(getattr(ds, "BodyPartExamined", None), "HEAD_NECK")
 
-            rescale_intercept = float(getattr(ds, "RescaleIntercept", 0.0))
-            rescale_slope = float(getattr(ds, "RescaleSlope", 1.0))
+            val_intercept = safe_parse_float(getattr(ds, "RescaleIntercept", None), 0.0)
+            rescale_intercept = 0.0 if val_intercept is None else val_intercept
 
-            window_center = None
-            if hasattr(ds, "WindowCenter"):
-                wc = ds.WindowCenter
-                window_center = float(wc[0] if isinstance(wc, (list, pydicom.multival.MultiValue)) else wc)
+            val_slope = safe_parse_float(getattr(ds, "RescaleSlope", None), 1.0)
+            rescale_slope = 1.0 if val_slope is None else val_slope
 
-            window_width = None
-            if hasattr(ds, "WindowWidth"):
-                ww = ds.WindowWidth
-                window_width = float(ww[0] if isinstance(ww, (list, pydicom.multival.MultiValue)) else ww)
+            window_center = safe_parse_float(getattr(ds, "WindowCenter", None), None)
+            window_width = safe_parse_float(getattr(ds, "WindowWidth", None), None)
+
+            extra_tags: Dict[str, Any] = {}
+            for tag_name in (
+                "SliceThickness",
+                "SpacingBetweenSlices",
+                "PixelSpacing",
+                "PatientSex",
+                "PatientAge",
+                "StudyDate",
+                "SeriesDate",
+                "StudyDescription",
+                "SeriesDescription",
+                "Manufacturer",
+            ):
+                if hasattr(ds, tag_name):
+                    raw_val = getattr(ds, tag_name)
+                    if raw_val is not None:
+                        val_str = str(raw_val).strip()
+                        if val_str and val_str.lower() not in ("none", "null"):
+                            extra_tags[tag_name] = val_str
 
             return VolumetricMetadata(
                 patient_id=patient_id,
@@ -276,6 +364,7 @@ class DicomVolumeLoader:
                 rescale_slope=rescale_slope,
                 window_center=window_center,
                 window_width=window_width,
+                extra_tags=extra_tags,
             )
         except Exception as exc:
             logger.warning("Could not read full DICOM tags from '%s' via pydicom: %s", sample_slice_path, exc)
@@ -324,7 +413,10 @@ class DicomVolumeLoader:
 
         resolved_output = Path(output_path).resolve()
         resolved_output.parent.mkdir(parents=True, exist_ok=True)
-        mask_sitk = sitk.GetImageFromArray(mask_array.astype(np.uint8))
+
+        max_label = int(np.max(mask_array)) if mask_array.size > 0 else 0
+        mask_dtype = np.uint16 if max_label > 255 else np.uint8
+        mask_sitk = sitk.GetImageFromArray(mask_array.astype(mask_dtype))
         mask_sitk.SetSpacing(reference_image.GetSpacing())
         mask_sitk.SetOrigin(reference_image.GetOrigin())
         mask_sitk.SetDirection(reference_image.GetDirection())

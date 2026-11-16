@@ -21,7 +21,12 @@ from sqlalchemy import create_engine
 from medical_segmentation.config import AzureStorageSettings, DatabaseSettings, PipelineConfig
 from medical_segmentation.db.database import DatabaseManager
 from medical_segmentation.io.azure_client import AzureBlobClient
-from medical_segmentation.io.dicom_loader import DicomVolumeLoader, VolumetricMetadata
+from medical_segmentation.io.dicom_loader import (
+    DicomVolumeLoader,
+    VolumetricMetadata,
+    safe_parse_float,
+    safe_parse_str,
+)
 from medical_segmentation.pipeline.orchestrator import PipelineOrchestrator, PipelineResult
 
 
@@ -715,4 +720,123 @@ def test_orchestrator_end_to_end_azure_series_prefix_run(tmp_path: Path) -> None
     assert result.mask_array.shape == (32, 32, 32)
     mock_azure.download_series_prefix.assert_called_once()
     mock_azure.upload_file_to_blob.assert_called_once()
+
+
+def test_safe_parse_float_and_str_edge_cases() -> None:
+    """Verify safe_parse_float and safe_parse_str handle edge cases robustly."""
+    # safe_parse_float
+    assert safe_parse_float(None, 0.0) == 0.0
+    assert safe_parse_float("", 0.0) == 0.0
+    assert safe_parse_float("   ", 0.0) == 0.0
+    assert safe_parse_float("none", 0.0) == 0.0
+    assert safe_parse_float("null", 0.0) == 0.0
+    assert safe_parse_float([], 0.0) == 0.0
+    assert safe_parse_float([None], 0.0) == 0.0
+    assert safe_parse_float([""], 0.0) == 0.0
+    assert safe_parse_float(["40.0", "80.0"], 0.0) == 40.0
+    assert safe_parse_float("40.0\\80.0", 0.0) == 40.0
+    assert safe_parse_float(40) == 40.0
+    assert safe_parse_float(40.5) == 40.5
+    assert safe_parse_float("not_a_float", 0.0) == 0.0
+    assert safe_parse_float(None) is None
+
+    # safe_parse_str
+    assert safe_parse_str(None, "ANONYMOUS") == "ANONYMOUS"
+    assert safe_parse_str("", "ANONYMOUS") == "ANONYMOUS"
+    assert safe_parse_str("   ", "ANONYMOUS") == "ANONYMOUS"
+    assert safe_parse_str("None", "ANONYMOUS") == "ANONYMOUS"
+    assert safe_parse_str("null", "ANONYMOUS") == "ANONYMOUS"
+    assert safe_parse_str("  PATIENT_123  ", "ANONYMOUS") == "PATIENT_123"
+    assert safe_parse_str("CT", "CT") == "CT"
+
+
+def test_dicom_volume_loader_extract_pydicom_metadata_empty_and_malformed_tags(tmp_path: Path) -> None:
+    """Verify _extract_pydicom_metadata preserves clinical metadata when window/rescale tags are empty or malformed."""
+    slice_path = tmp_path / "slice_empty_tags.dcm"
+
+    file_meta = FileMetaDataset()
+    file_meta.MediaStorageSOPClassUID = pydicom.uid.CTImageStorage
+    file_meta.MediaStorageSOPInstanceUID = pydicom.uid.generate_uid()
+    file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
+
+    ds = Dataset()
+    ds.file_meta = file_meta
+    ds.PatientID = "REAL_PATIENT_123"
+    ds.StudyInstanceUID = "1.2.3.4.5"
+    ds.SeriesInstanceUID = "1.2.3.4.5.6"
+    ds.Modality = "CT"
+    ds.BodyPartExamined = "CHEST"
+    ds.SliceThickness = "2.5"
+    ds.PatientSex = "M"
+    # Empty tags that previously triggered TypeError / IndexError and wiped out all metadata
+    ds.WindowCenter = []
+    ds.WindowWidth = ""
+
+    pydicom.dcmwrite(str(slice_path), ds, enforce_file_format=True)
+
+    loader = DicomVolumeLoader()
+    meta = loader._extract_pydicom_metadata(slice_path)
+
+    assert meta.patient_id == "REAL_PATIENT_123"
+    assert meta.study_instance_uid == "1.2.3.4.5"
+    assert meta.series_instance_uid == "1.2.3.4.5.6"
+    assert meta.modality == "CT"
+    assert meta.body_part == "CHEST"
+    assert meta.window_center is None
+    assert meta.window_width is None
+    assert meta.rescale_intercept == 0.0
+    assert meta.rescale_slope == 1.0
+    assert meta.extra_tags.get("SliceThickness") == "2.5"
+    assert meta.extra_tags.get("PatientSex") == "M"
+
+
+def test_dicom_volume_loader_load_volume_file_clean_stem(tmp_path: Path) -> None:
+    """Verify load_volume_file strips .nii.gz properly so study_instance_uid has no .nii suffix."""
+    arr = np.zeros((8, 8, 8), dtype=np.float32)
+    img = sitk.GetImageFromArray(arr)
+    nii_path = tmp_path / "scan_patient_99.nii.gz"
+    sitk.WriteImage(img, str(nii_path))
+
+    loader = DicomVolumeLoader()
+    _, meta = loader.load_volume_file(nii_path)
+
+    assert meta.study_instance_uid == "scan_patient_99"
+    assert not meta.study_instance_uid.endswith(".nii")
+
+
+def test_dicom_volume_loader_load_volume_file_single_dcm(tmp_path: Path) -> None:
+    """Verify load_volume_file extracts DICOM tags when given a standalone .dcm file."""
+    slice_path = tmp_path / "single_slice.dcm"
+    _create_synthetic_dicom_slice(
+        path=slice_path,
+        patient_id="PATIENT_STANDALONE",
+        study_uid="1.2.999.1",
+        series_uid="1.2.999.2",
+    )
+
+    loader = DicomVolumeLoader()
+    sitk_img, meta = loader.load_volume_file(slice_path)
+
+    assert isinstance(sitk_img, sitk.Image)
+    assert meta.patient_id == "PATIENT_STANDALONE"
+    assert meta.study_instance_uid == "1.2.999.1"
+    assert meta.series_instance_uid == "1.2.999.2"
+
+
+def test_dicom_volume_loader_save_mask_as_nifti_large_label_dtype(tmp_path: Path) -> None:
+    """Verify save_mask_as_nifti supports multi-label masks > 255 without uint8 overflow."""
+    ref_img = sitk.GetImageFromArray(np.zeros((4, 4, 4), dtype=np.float32))
+    ref_img.SetSpacing((1.0, 1.0, 1.0))
+
+    # Mask with label 300 (would wrap to 44 with uint8)
+    mask_arr = np.zeros((4, 4, 4), dtype=np.int32)
+    mask_arr[1, 1, 1] = 300
+
+    out_file = tmp_path / "mask_uint16.nii.gz"
+    DicomVolumeLoader.save_mask_as_nifti(mask_arr, ref_img, out_file)
+
+    loaded_img = sitk.ReadImage(str(out_file))
+    loaded_arr = sitk.GetArrayFromImage(loaded_img)
+    assert loaded_arr[1, 1, 1] == 300
+    assert np.array_equal(loaded_arr, mask_arr)
 
