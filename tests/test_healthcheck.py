@@ -14,6 +14,15 @@ from sqlalchemy.exc import OperationalError
 
 from medical_segmentation.config import DatabaseSettings, PipelineConfig
 from medical_segmentation.db.database import DatabaseManager
+from medical_segmentation.diagnostics import (
+    SystemHealthChecker,
+    check_database,
+    check_monai,
+    check_python,
+    check_simpleitk,
+    check_torch,
+    check_workspace,
+)
 from medical_segmentation.main import (
     check_system_health,
     main,
@@ -144,3 +153,65 @@ def test_cli_main_entrypoint_healthcheck(monkeypatch: pytest.MonkeyPatch) -> Non
             main()
         assert exc_info.value.code == 0
         mock_health.assert_called_once_with(check_db=False)
+
+
+def test_diagnostics_individual_probes(tmp_path: Path) -> None:
+    """Verify individual decoupled diagnostic probes execute and report status."""
+    # 1. Python probe
+    py_res = check_python()
+    assert py_res["status"] == "ok"
+    assert "version" in py_res
+
+    # 2. PyTorch probe
+    torch_res = check_torch("cpu")
+    assert torch_res["status"] == "ok"
+    assert torch_res["device"] == "cpu"
+    assert "cuda_available" in torch_res
+
+    torch_err = check_torch("invalid_device_name_xyz")
+    assert torch_err["status"] == "error"
+    assert "error" in torch_err
+
+    # 3. SimpleITK probe
+    sitk_res = check_simpleitk()
+    assert sitk_res["status"] == "ok"
+    assert "version" in sitk_res
+
+    # 4. MONAI probe
+    monai_res = check_monai()
+    assert monai_res["status"] == "ok"
+    assert monai_res["model_initialized"] is True
+
+    # 5. Workspace probe
+    ws_ok = check_workspace(tmp_path / "valid_dir")
+    assert ws_ok["status"] == "ok"
+    assert ws_ok["writable"] is True
+
+    ws_fail = check_workspace(tmp_path / "read_only" / "\0invalid_path")
+    assert ws_fail["status"] == "error"
+
+    # 6. Database probe with mock
+    with patch("medical_segmentation.db.database.DatabaseManager.check_connection", return_value=True):
+        db_ok = check_database(DatabaseSettings())
+        assert db_ok["status"] == "ok"
+
+    with patch("medical_segmentation.db.database.DatabaseManager.check_connection", return_value=False):
+        db_fail = check_database(DatabaseSettings())
+        assert db_fail["status"] == "error"
+
+
+def test_system_health_checker_class(tmp_path: Path) -> None:
+    """Verify SystemHealthChecker orchestrates probes and produces aggregate report."""
+    cfg = PipelineConfig(work_dir=tmp_path / "checker_workdir")
+    checker = SystemHealthChecker(config=cfg)
+
+    report = checker.check_all(check_db=False)
+    assert report["status"] == "healthy"
+    assert len(report["components"]) == 5
+    assert "database" not in report["components"]
+
+    with patch("medical_segmentation.diagnostics.check_monai", return_value={"status": "error", "error": "mock err"}):
+        fail_report = checker.check_all(check_db=False)
+        assert fail_report["status"] == "unhealthy"
+        assert fail_report["components"]["monai"]["status"] == "error"
+

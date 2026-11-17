@@ -32,7 +32,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application source code
-COPY --chown=appuser:medseg __init__.py config.py main.py ./
+COPY --chown=appuser:medseg __init__.py config.py diagnostics.py main.py ./
 COPY --chown=appuser:medseg io/ ./io/
 COPY --chown=appuser:medseg pipeline/ ./pipeline/
 COPY --chown=appuser:medseg db/ ./db/
