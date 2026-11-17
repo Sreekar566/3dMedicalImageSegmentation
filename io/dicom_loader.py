@@ -15,6 +15,7 @@ import pydicom
 import SimpleITK as sitk
 
 from medical_segmentation.config import validate_orientation_code
+from medical_segmentation.io.mask_writer import save_mask_as_nifti
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +23,11 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DicomVolumeLoader",
     "VolumetricMetadata",
+    "extract_pydicom_metadata",
     "safe_parse_float",
     "safe_parse_str",
+    "save_mask_as_nifti",
+    "sitk_to_numpy",
 ]
 
 
@@ -181,6 +185,14 @@ class VolumetricMetadata:
         )
 
 
+def sitk_to_numpy(image: sitk.Image) -> np.ndarray:
+    """
+    Convert SimpleITK image to a float32 NumPy array.
+    Note: SimpleITK GetArrayFromImage returns order (Z, Y, X).
+    """
+    return sitk.GetArrayFromImage(image).astype(np.float32)
+
+
 class DicomVolumeLoader:
     """Robust volumetric medical image ingestion engine supporting DICOM series and NIfTI volumes."""
 
@@ -315,112 +327,74 @@ class DicomVolumeLoader:
 
         return oriented_image, metadata
 
-    def _extract_pydicom_metadata(self, sample_slice_path: Path) -> VolumetricMetadata:
+    def _extract_pydicom_metadata(self, sample_slice_path: Path | str) -> VolumetricMetadata:
         """Parse DICOM header attributes from a slice using pydicom."""
-        try:
-            ds = pydicom.dcmread(sample_slice_path, stop_before_pixels=True)
-            patient_id = safe_parse_str(getattr(ds, "PatientID", None), "ANONYMOUS")
-            study_uid = safe_parse_str(getattr(ds, "StudyInstanceUID", None), "")
-            series_uid = safe_parse_str(getattr(ds, "SeriesInstanceUID", None), "")
-            modality = safe_parse_str(getattr(ds, "Modality", None), "CT").upper()
-            body_part = safe_parse_str(getattr(ds, "BodyPartExamined", None), "HEAD_NECK")
+        return extract_pydicom_metadata(sample_slice_path)
 
-            val_intercept = safe_parse_float(getattr(ds, "RescaleIntercept", None), 0.0)
-            rescale_intercept = 0.0 if val_intercept is None else val_intercept
+    sitk_to_numpy = staticmethod(sitk_to_numpy)
+    save_mask_as_nifti = staticmethod(save_mask_as_nifti)
 
-            val_slope = safe_parse_float(getattr(ds, "RescaleSlope", None), 1.0)
-            rescale_slope = 1.0 if val_slope is None else val_slope
 
-            window_center = safe_parse_float(getattr(ds, "WindowCenter", None), None)
-            window_width = safe_parse_float(getattr(ds, "WindowWidth", None), None)
+def extract_pydicom_metadata(sample_slice_path: Path | str) -> VolumetricMetadata:
+    """
+    Parse DICOM header attributes from a slice using pydicom.
 
-            extra_tags: Dict[str, Any] = {}
-            for tag_name in (
-                "SliceThickness",
-                "SpacingBetweenSlices",
-                "PixelSpacing",
-                "PatientSex",
-                "PatientAge",
-                "StudyDate",
-                "SeriesDate",
-                "StudyDescription",
-                "SeriesDescription",
-                "Manufacturer",
-            ):
-                if hasattr(ds, tag_name):
-                    raw_val = getattr(ds, tag_name)
-                    if raw_val is not None:
-                        val_str = str(raw_val).strip()
-                        if val_str and val_str.lower() not in ("none", "null"):
-                            extra_tags[tag_name] = val_str
+    Args:
+        sample_slice_path: Path to a DICOM (.dcm) slice file.
 
-            return VolumetricMetadata(
-                patient_id=patient_id,
-                study_instance_uid=study_uid,
-                series_instance_uid=series_uid,
-                modality=modality,
-                body_part=body_part,
-                rescale_intercept=rescale_intercept,
-                rescale_slope=rescale_slope,
-                window_center=window_center,
-                window_width=window_width,
-                extra_tags=extra_tags,
-            )
-        except Exception as exc:
-            logger.warning("Could not read full DICOM tags from '%s' via pydicom: %s", sample_slice_path, exc)
-            return VolumetricMetadata()
+    Returns:
+        Populated VolumetricMetadata instance.
+    """
+    try:
+        resolved_slice = Path(sample_slice_path).resolve()
+        ds = pydicom.dcmread(resolved_slice, stop_before_pixels=True)
+        patient_id = safe_parse_str(getattr(ds, "PatientID", None), "ANONYMOUS")
+        study_uid = safe_parse_str(getattr(ds, "StudyInstanceUID", None), "")
+        series_uid = safe_parse_str(getattr(ds, "SeriesInstanceUID", None), "")
+        modality = safe_parse_str(getattr(ds, "Modality", None), "CT").upper()
+        body_part = safe_parse_str(getattr(ds, "BodyPartExamined", None), "HEAD_NECK")
 
-    @staticmethod
-    def sitk_to_numpy(image: sitk.Image) -> np.ndarray:
-        """
-        Convert SimpleITK image to a float32 NumPy array.
-        Note: SimpleITK GetArrayFromImage returns order (Z, Y, X).
-        """
-        return sitk.GetArrayFromImage(image).astype(np.float32)
+        val_intercept = safe_parse_float(getattr(ds, "RescaleIntercept", None), 0.0)
+        rescale_intercept = 0.0 if val_intercept is None else val_intercept
 
-    @staticmethod
-    def save_mask_as_nifti(
-        mask_array: np.ndarray,
-        reference_image: sitk.Image,
-        output_path: Path | str,
-    ) -> Path:
-        """
-        Save a 3D segmentation mask (NumPy array) back to a NIfTI (.nii.gz) file,
-        preserving the exact physical coordinate system (origin, spacing, direction matrix)
-        of the reference oriented SimpleITK image.
+        val_slope = safe_parse_float(getattr(ds, "RescaleSlope", None), 1.0)
+        rescale_slope = 1.0 if val_slope is None else val_slope
 
-        Args:
-            mask_array: Binary or multi-class integer NumPy array (Z, Y, X).
-            reference_image: The oriented sitk.Image used during inference.
-            output_path: Path to write the .nii.gz file.
+        window_center = safe_parse_float(getattr(ds, "WindowCenter", None), None)
+        window_width = safe_parse_float(getattr(ds, "WindowWidth", None), None)
 
-        Returns:
-            The resolved Path to the saved file.
-        """
-        if not isinstance(mask_array, np.ndarray):
-            raise TypeError(f"mask_array must be a numpy ndarray, got {type(mask_array).__name__}.")
-        if mask_array.ndim != 3:
-            raise ValueError(f"mask_array must be 3-dimensional (Z, Y, X), got {mask_array.ndim} dimensions.")
-        if not isinstance(reference_image, sitk.Image):
-            raise TypeError(f"reference_image must be a SimpleITK Image, got {type(reference_image).__name__}.")
+        extra_tags: Dict[str, Any] = {}
+        for tag_name in (
+            "SliceThickness",
+            "SpacingBetweenSlices",
+            "PixelSpacing",
+            "PatientSex",
+            "PatientAge",
+            "StudyDate",
+            "SeriesDate",
+            "StudyDescription",
+            "SeriesDescription",
+            "Manufacturer",
+        ):
+            if hasattr(ds, tag_name):
+                raw_val = getattr(ds, tag_name)
+                if raw_val is not None:
+                    val_str = str(raw_val).strip()
+                    if val_str and val_str.lower() not in ("none", "null"):
+                        extra_tags[tag_name] = val_str
 
-        ref_size = reference_image.GetSize()  # (X, Y, Z)
-        expected_shape = (ref_size[2], ref_size[1], ref_size[0])  # (Z, Y, X)
-        if mask_array.shape != expected_shape:
-            raise ValueError(
-                f"mask_array shape {mask_array.shape} does not match reference image shape {expected_shape}."
-            )
-
-        resolved_output = Path(output_path).resolve()
-        resolved_output.parent.mkdir(parents=True, exist_ok=True)
-
-        max_label = int(np.max(mask_array)) if mask_array.size > 0 else 0
-        mask_dtype = np.uint16 if max_label > 255 else np.uint8
-        mask_sitk = sitk.GetImageFromArray(mask_array.astype(mask_dtype))
-        mask_sitk.SetSpacing(reference_image.GetSpacing())
-        mask_sitk.SetOrigin(reference_image.GetOrigin())
-        mask_sitk.SetDirection(reference_image.GetDirection())
-
-        logger.info("Writing 3D segmentation mask to: %s", resolved_output)
-        sitk.WriteImage(mask_sitk, str(resolved_output), True)  # True = compression enabled
-        return resolved_output
+        return VolumetricMetadata(
+            patient_id=patient_id,
+            study_instance_uid=study_uid,
+            series_instance_uid=series_uid,
+            modality=modality,
+            body_part=body_part,
+            rescale_intercept=rescale_intercept,
+            rescale_slope=rescale_slope,
+            window_center=window_center,
+            window_width=window_width,
+            extra_tags=extra_tags,
+        )
+    except Exception as exc:
+        logger.warning("Could not read full DICOM tags from '%s' via pydicom: %s", sample_slice_path, exc)
+        return VolumetricMetadata()

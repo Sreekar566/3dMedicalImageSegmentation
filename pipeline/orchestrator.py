@@ -24,7 +24,8 @@ from medical_segmentation.config import (
     validate_orientation_code,
 )
 from medical_segmentation.io.azure_client import AzureBlobClient
-from medical_segmentation.io.dicom_loader import DicomVolumeLoader, VolumetricMetadata
+from medical_segmentation.io.dicom_loader import DicomVolumeLoader, VolumetricMetadata, sitk_to_numpy
+from medical_segmentation.io.mask_writer import save_mask_as_nifti
 from medical_segmentation.pipeline.inference import SlidingWindowInferenceEngine
 from medical_segmentation.pipeline.metrics import (
     SegmentationMetrics,
@@ -270,7 +271,7 @@ class PipelineOrchestrator:
         mask_filename = f"mask_{clean_uid}_{int(time.time())}.nii.gz"
         local_mask_path = self.workspace / "outputs" / mask_filename
 
-        DicomVolumeLoader.save_mask_as_nifti(
+        save_mask_as_nifti(
             mask_array=mask_array,
             reference_image=reference_image,
             output_path=local_mask_path,
@@ -388,7 +389,7 @@ class PipelineOrchestrator:
             volume_tensor=volume_tensor,
             checkpoint=checkpoint,
         )
-        raw_array = DicomVolumeLoader.sitk_to_numpy(sitk_image)
+        raw_array = sitk_to_numpy(sitk_image)
 
         logger.info("=== Step 5: Quantitative Metric Extraction ===")
         summary_metrics, slice_generator = self.extract_metrics(

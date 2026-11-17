@@ -24,9 +24,12 @@ from medical_segmentation.io.azure_client import AzureBlobClient
 from medical_segmentation.io.dicom_loader import (
     DicomVolumeLoader,
     VolumetricMetadata,
+    extract_pydicom_metadata,
     safe_parse_float,
     safe_parse_str,
+    sitk_to_numpy,
 )
+from medical_segmentation.io.mask_writer import VolumetricMaskWriter, save_mask_as_nifti
 from medical_segmentation.pipeline.orchestrator import PipelineOrchestrator, PipelineResult
 
 
@@ -870,4 +873,131 @@ def test_azure_client_string_path_support(tmp_path: Path) -> None:
     mock_bc.url = "https://mock.blob.core.windows.net/med-container/upload_target.nii.gz"
     url = client.upload_file_to_blob("med-container", "upload_target.nii.gz", str(dummy_file))
     assert url == mock_bc.url
+
+
+def test_mask_writer_standalone_save_mask_as_nifti_with_sitk_image(tmp_path: Path) -> None:
+    """Verify standalone save_mask_as_nifti saves mask accurately with sitk.Image reference."""
+    ref_arr = np.zeros((6, 12, 18), dtype=np.float32)
+    ref_img = sitk.GetImageFromArray(ref_arr)
+    ref_img.SetSpacing((1.1, 1.2, 2.0))
+    ref_img.SetOrigin((5.0, 15.0, 25.0))
+
+    mask_arr = np.ones((6, 12, 18), dtype=np.uint8)
+    out_file = tmp_path / "mask_sitk_ref.nii.gz"
+
+    result_path = save_mask_as_nifti(
+        mask_array=mask_arr,
+        reference_image=ref_img,
+        output_path=out_file,
+    )
+    assert result_path == out_file
+    assert out_file.is_file()
+
+    loaded = sitk.ReadImage(str(out_file))
+    assert loaded.GetSize() == (18, 12, 6)
+    assert np.allclose(loaded.GetSpacing(), (1.1, 1.2, 2.0))
+    assert np.allclose(loaded.GetOrigin(), (5.0, 15.0, 25.0))
+    assert np.array_equal(sitk.GetArrayFromImage(loaded), mask_arr)
+
+
+def test_mask_writer_standalone_save_mask_as_nifti_with_volumetric_metadata(tmp_path: Path) -> None:
+    """Verify save_mask_as_nifti saves mask accurately using VolumetricMetadata reference geometry."""
+    metadata = VolumetricMetadata(
+        dimensions=(15, 10, 5),  # (X, Y, Z)
+        spacing=(0.8, 0.8, 1.5),
+        origin=(10.0, 20.0, 30.0),
+        direction=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+        spatial_orientation="RAS",
+    )
+
+    mask_arr = np.zeros((5, 10, 15), dtype=np.uint8)  # (Z, Y, X)
+    mask_arr[2, 5, 7] = 1
+
+    out_file = tmp_path / "mask_meta_ref.nii.gz"
+    result_path = save_mask_as_nifti(
+        mask_array=mask_arr,
+        reference=metadata,
+        output_path=out_file,
+    )
+    assert result_path == out_file
+    assert out_file.is_file()
+
+    loaded = sitk.ReadImage(str(out_file))
+    assert loaded.GetSize() == (15, 10, 5)
+    assert np.allclose(loaded.GetSpacing(), (0.8, 0.8, 1.5))
+    assert np.allclose(loaded.GetOrigin(), (10.0, 20.0, 30.0))
+    assert np.allclose(loaded.GetDirection(), (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+    assert np.array_equal(sitk.GetArrayFromImage(loaded), mask_arr)
+
+
+def test_volumetric_mask_writer_class(tmp_path: Path) -> None:
+    """Verify VolumetricMaskWriter class manages default output directory and filename routing."""
+    out_dir = tmp_path / "staging_masks"
+    writer = VolumetricMaskWriter(default_output_dir=out_dir)
+    assert out_dir.is_dir()
+
+    ref_img = sitk.GetImageFromArray(np.zeros((4, 8, 8), dtype=np.float32))
+    ref_img.SetSpacing((1.0, 1.0, 1.0))
+    mask_arr = np.zeros((4, 8, 8), dtype=np.uint8)
+
+    # 1. Write via filename relative to default_output_dir
+    saved = writer.write_mask(mask_arr, reference=ref_img, filename="pred.nii.gz")
+    assert saved == out_dir / "pred.nii.gz"
+    assert saved.is_file()
+
+    # 2. Write via explicit output_path
+    custom_path = tmp_path / "custom" / "custom_mask.nii.gz"
+    saved_custom = writer.write_mask(mask_arr, reference=ref_img, output_path=custom_path)
+    assert saved_custom == custom_path
+    assert custom_path.is_file()
+
+    # 3. Missing both output_path and filename raises ValueError
+    writer_no_dir = VolumetricMaskWriter()
+    with pytest.raises(ValueError, match="Either output_path or filename"):
+        writer_no_dir.write_mask(mask_arr, reference=ref_img)
+
+
+def test_mask_writer_validation_errors(tmp_path: Path) -> None:
+    """Verify mask writer input validation for reference types and output paths."""
+    mask_arr = np.zeros((4, 4, 4), dtype=np.uint8)
+    ref_img = sitk.GetImageFromArray(np.zeros((4, 4, 4), dtype=np.float32))
+
+    # Missing reference
+    with pytest.raises(TypeError, match="reference_image must be a SimpleITK Image or VolumetricMetadata, got None"):
+        save_mask_as_nifti(mask_arr, reference=None, output_path=tmp_path / "out.nii.gz")
+
+    # Invalid reference type
+    with pytest.raises(TypeError, match="reference_image must be a SimpleITK Image or VolumetricMetadata, got int"):
+        save_mask_as_nifti(mask_arr, reference=12345, output_path=tmp_path / "out.nii.gz")  # type: ignore[arg-type]
+
+    # Missing output_path
+    with pytest.raises(ValueError, match="output_path must be specified"):
+        save_mask_as_nifti(mask_arr, reference=ref_img, output_path=None)
+
+
+def test_extract_pydicom_metadata_and_sitk_to_numpy_standalone(tmp_path: Path) -> None:
+    """Verify standalone extract_pydicom_metadata and sitk_to_numpy functions."""
+    slice_path = tmp_path / "slice_standalone.dcm"
+    _create_synthetic_dicom_slice(
+        path=slice_path,
+        patient_id="STANDALONE_PAT",
+        study_uid="1.2.3.99",
+        series_uid="1.2.3.99.1",
+        modality="CT",
+    )
+
+    metadata = extract_pydicom_metadata(slice_path)
+    assert metadata.patient_id == "STANDALONE_PAT"
+    assert metadata.study_instance_uid == "1.2.3.99"
+    assert metadata.series_instance_uid == "1.2.3.99.1"
+    assert metadata.modality == "CT"
+
+    # sitk_to_numpy
+    img = sitk.GetImageFromArray(np.full((3, 4, 5), fill_value=42.0, dtype=np.float32))
+    arr = sitk_to_numpy(img)
+    assert isinstance(arr, np.ndarray)
+    assert arr.shape == (3, 4, 5)
+    assert arr.dtype == np.float32
+    assert np.allclose(arr, 42.0)
+
 
