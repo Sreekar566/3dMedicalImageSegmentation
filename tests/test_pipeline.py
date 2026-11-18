@@ -25,6 +25,7 @@ from medical_segmentation.config import (
 )
 from medical_segmentation.db.database import DatabaseManager, chunked_iterable
 from medical_segmentation.io.dicom_loader import DicomVolumeLoader, VolumetricMetadata
+from medical_segmentation.io.mask_writer import VolumetricMaskWriter
 from medical_segmentation.main import main, parse_args, run_pipeline
 from medical_segmentation.pipeline import (
     PipelineOrchestrator,
@@ -1353,5 +1354,163 @@ def test_pipeline_orchestrator_workspace_str_handling(tmp_path: Path) -> None:
     orchestrator = PipelineOrchestrator(workspace=str_workspace)
     assert isinstance(orchestrator.workspace, Path)
     assert orchestrator.workspace.is_dir()
+
+
+def test_pipeline_orchestrator_mask_writer_injection(tmp_path: Path) -> None:
+    """Verify that a custom VolumetricMaskWriter can be injected into PipelineOrchestrator."""
+    custom_output_dir = tmp_path / "custom_masks"
+    custom_writer = VolumetricMaskWriter(default_output_dir=custom_output_dir)
+
+    orchestrator = PipelineOrchestrator(
+        workspace=tmp_path / "ws",
+        mask_writer=custom_writer,
+    )
+    assert orchestrator.mask_writer is custom_writer
+
+    ref_img = sitk.GetImageFromArray(np.zeros((8, 8, 8), dtype=np.float32))
+    ref_img.SetSpacing((1.0, 1.0, 1.0))
+    mask_arr = np.zeros((8, 8, 8), dtype=np.uint8)
+    meta = VolumetricMetadata(study_instance_uid="STUDY_INJECT")
+
+    saved_path, blob_uri = orchestrator.export_mask(
+        mask_array=mask_arr,
+        reference_image=ref_img,
+        metadata=meta,
+        dry_run=True,
+    )
+    assert saved_path.parent == custom_output_dir
+    assert saved_path.is_file()
+    assert blob_uri is None
+
+
+def test_pipeline_orchestrator_generate_mask_filename() -> None:
+    """Verify generate_mask_filename properly formats clean UIDs and incorporates timestamps."""
+    orchestrator = PipelineOrchestrator()
+    meta = VolumetricMetadata(study_instance_uid="1.2.840.113619.2.55/test:run")
+
+    filename = orchestrator.generate_mask_filename(meta, timestamp=1700000000)
+    assert filename == "mask_1.2.840.113619.2.55_test_run_1700000000.nii.gz"
+
+    # Fallback to 'run' when study_instance_uid is empty
+    empty_meta = VolumetricMetadata(study_instance_uid="")
+    fallback_filename = orchestrator.generate_mask_filename(empty_meta, timestamp=12345)
+    assert fallback_filename == "mask_run_12345.nii.gz"
+
+
+def test_pipeline_orchestrator_upload_mask_helper(tmp_path: Path) -> None:
+    """Verify upload_mask helper handles dry-run, disconnected client, and successful upload."""
+    mock_azure = MagicMock()
+    mock_azure.is_connected = True
+    mock_azure.upload_file_to_blob.return_value = "https://azure.blob/segmentations/mask.nii.gz"
+
+    orchestrator = PipelineOrchestrator(azure_client=mock_azure, workspace=tmp_path)
+    mask_file = tmp_path / "mask_test.nii.gz"
+    mask_file.write_bytes(b"dummy_nifti")
+
+    # 1. Dry run returns None and skips upload
+    uri_dry = orchestrator.upload_mask(mask_file, "mask_test.nii.gz", dry_run=True)
+    assert uri_dry is None
+    mock_azure.upload_file_to_blob.assert_not_called()
+
+    # 2. Live upload returns blob URI
+    uri_live = orchestrator.upload_mask(mask_file, "mask_test.nii.gz", dry_run=False)
+    assert uri_live == "https://azure.blob/segmentations/mask.nii.gz"
+    mock_azure.upload_file_to_blob.assert_called_once()
+
+    # 3. Disconnected client skips upload
+    mock_azure.reset_mock()
+    mock_azure.is_connected = False
+    uri_offline = orchestrator.upload_mask(mask_file, "mask_test.nii.gz", dry_run=False)
+    assert uri_offline is None
+    mock_azure.upload_file_to_blob.assert_not_called()
+
+
+def test_pipeline_orchestrator_context_manager_and_close() -> None:
+    """Verify PipelineOrchestrator close() and context manager protocol properly dispose db_manager."""
+    mock_db = MagicMock(spec=DatabaseManager)
+    orchestrator = PipelineOrchestrator(db_manager=mock_db)
+
+    # Context manager invocation
+    with orchestrator as ctx:
+        assert ctx is orchestrator
+    mock_db.dispose.assert_called_once()
+
+    # Explicit close invocation
+    mock_db.reset_mock()
+    orchestrator.close()
+    mock_db.dispose.assert_called_once()
+
+
+def test_pipeline_result_properties_and_to_dict(tmp_path: Path) -> None:
+    """Verify PipelineResult boolean properties and to_dict serialization."""
+    from medical_segmentation.pipeline.metrics import LabelSummaryMetric
+
+    meta = VolumetricMetadata(
+        patient_id="P_001",
+        study_instance_uid="1.2.3.4",
+        modality="CT",
+        dimensions=(10, 20, 30),
+        spacing=(1.0, 1.0, 2.0),
+        spatial_orientation="RAS",
+    )
+    label = LabelSummaryMetric(
+        label_id=1,
+        structure_name="Lesion",
+        voxel_count=50,
+        volume_mm3=100.0,
+        volume_cm3=0.1,
+        mean_intensity=50.0,
+        std_intensity=5.0,
+        min_intensity=40.0,
+        max_intensity=60.0,
+        centroid_mm=(5.0, 10.0, 15.0),
+        bounding_box=(0, 0, 0, 5, 5, 5),
+    )
+    metrics = SegmentationMetrics(duration_seconds=1.23, labels=[label])
+
+    # Case 1: Fully persisted and uploaded
+    res_full = PipelineResult(
+        summary_metrics=metrics,
+        mask_array=np.zeros((30, 20, 10), dtype=np.uint8),
+        local_mask_path=tmp_path / "mask.nii.gz",
+        output_blob_uri="https://blob/mask.nii.gz",
+        study_id=10,
+        run_id=20,
+        slices_inserted=30,
+        duration_seconds=2.5,
+        metadata=meta,
+    )
+    assert res_full.is_persisted_to_db is True
+    assert res_full.is_uploaded_to_cloud is True
+
+    d = res_full.to_dict()
+    assert d["study_id"] == 10
+    assert d["run_id"] == 20
+    assert d["duration_seconds"] == 2.5
+    assert d["is_persisted_to_db"] is True
+    assert d["is_uploaded_to_cloud"] is True
+    assert d["patient_id"] == "P_001"
+    assert d["study_instance_uid"] == "1.2.3.4"
+    assert d["modality"] == "CT"
+    assert d["dimensions"] == [10, 20, 30]
+    assert d["spacing"] == [1.0, 1.0, 2.0]
+    assert d["spatial_orientation"] == "RAS"
+    assert d["labels_count"] == 1
+
+    # Case 2: Dry run (not persisted, not uploaded)
+    res_dry = PipelineResult(
+        summary_metrics=metrics,
+        mask_array=np.zeros((30, 20, 10), dtype=np.uint8),
+        local_mask_path=tmp_path / "mask.nii.gz",
+        output_blob_uri=None,
+        study_id=None,
+        run_id=None,
+        slices_inserted=0,
+        duration_seconds=1.0,
+        metadata=meta,
+    )
+    assert res_dry.is_persisted_to_db is False
+    assert res_dry.is_uploaded_to_cloud is False
+
 
 

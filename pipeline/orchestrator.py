@@ -25,7 +25,7 @@ from medical_segmentation.config import (
 )
 from medical_segmentation.io.azure_client import AzureBlobClient
 from medical_segmentation.io.dicom_loader import DicomVolumeLoader, VolumetricMetadata, sitk_to_numpy
-from medical_segmentation.io.mask_writer import save_mask_as_nifti
+from medical_segmentation.io.mask_writer import VolumetricMaskWriter, save_mask_as_nifti
 from medical_segmentation.pipeline.inference import SlidingWindowInferenceEngine
 from medical_segmentation.pipeline.metrics import (
     SegmentationMetrics,
@@ -54,6 +54,36 @@ class PipelineResult:
     duration_seconds: float
     metadata: VolumetricMetadata
 
+    @property
+    def is_persisted_to_db(self) -> bool:
+        """Check whether segmentation run was successfully persisted to PostgreSQL."""
+        return self.study_id is not None and self.run_id is not None
+
+    @property
+    def is_uploaded_to_cloud(self) -> bool:
+        """Check whether segmentation mask was uploaded to Azure Blob Storage."""
+        return bool(self.output_blob_uri)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert pipeline execution summary to a JSON-serializable dictionary."""
+        return {
+            "study_id": self.study_id,
+            "run_id": self.run_id,
+            "duration_seconds": self.duration_seconds,
+            "local_mask_path": str(self.local_mask_path),
+            "output_blob_uri": self.output_blob_uri,
+            "slices_inserted": self.slices_inserted,
+            "is_persisted_to_db": self.is_persisted_to_db,
+            "is_uploaded_to_cloud": self.is_uploaded_to_cloud,
+            "patient_id": self.metadata.patient_id,
+            "study_instance_uid": self.metadata.study_instance_uid,
+            "modality": self.metadata.modality,
+            "dimensions": list(self.metadata.dimensions),
+            "spacing": list(self.metadata.spacing),
+            "spatial_orientation": self.metadata.spatial_orientation,
+            "labels_count": len(self.summary_metrics.labels),
+        }
+
 
 class PipelineOrchestrator:
     """
@@ -71,6 +101,7 @@ class PipelineOrchestrator:
         inference_engine: Optional[SlidingWindowInferenceEngine] = None,
         metrics_calculator: Optional[VolumetricMetricsCalculator] = None,
         workspace: Optional[Path | str] = None,
+        mask_writer: Optional[VolumetricMaskWriter] = None,
     ):
         self.config = config or default_config
         self.azure_client = azure_client or AzureBlobClient(self.config.azure)
@@ -82,6 +113,24 @@ class PipelineOrchestrator:
         self.metrics_calculator = metrics_calculator or VolumetricMetricsCalculator()
         self.workspace = Path(workspace or self.config.work_dir).resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
+        self.mask_writer = mask_writer or VolumetricMaskWriter(
+            default_output_dir=self.workspace / "outputs"
+        )
+
+    def close(self) -> None:
+        """
+        Release allocated resources and dispose of database connection pools if active.
+        """
+        if self.db_manager is not None and hasattr(self.db_manager, "dispose"):
+            self.db_manager.dispose()
+
+    def __enter__(self) -> PipelineOrchestrator:
+        """Context manager entry point."""
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Context manager exit point; ensures resource cleanup."""
+        self.close()
 
     def ingest_volume(
         self,
@@ -253,10 +302,62 @@ class PipelineOrchestrator:
 
         return summary_metrics, slice_generator
 
+    def generate_mask_filename(
+        self,
+        metadata: VolumetricMetadata,
+        timestamp: Optional[int] = None,
+    ) -> str:
+        """
+        Generate a standardized, filesystem-safe filename for a segmentation mask.
+
+        Args:
+            metadata: Volumetric clinical metadata containing study UID.
+            timestamp: Optional epoch timestamp (defaults to current time).
+
+        Returns:
+            Formatted NIfTI filename (e.g., 'mask_1_2_840_113619_1699999999.nii.gz').
+        """
+        clean_uid = re.sub(r"[^\w\-.]", "_", metadata.study_instance_uid or "run")
+        ts = int(time.time()) if timestamp is None else timestamp
+        return f"mask_{clean_uid}_{ts}.nii.gz"
+
+    def upload_mask(
+        self,
+        local_mask_path: Path,
+        mask_filename: str,
+        output_container: Optional[str] = None,
+        dry_run: bool = False,
+    ) -> Optional[str]:
+        """
+        Upload saved segmentation mask to Azure Blob Storage if connected and not in dry-run mode.
+
+        Args:
+            local_mask_path: Local filesystem path to the mask file.
+            mask_filename: Destination filename within Azure Blob prefix.
+            output_container: Azure destination container name.
+            dry_run: Whether to skip cloud upload.
+
+        Returns:
+            Uploaded Azure Blob URI string, or None if skipped.
+        """
+        if dry_run or not self.azure_client.is_connected:
+            logger.info("Dry-run active or Azure disconnected; skipped mask cloud upload.")
+            return None
+
+        container = output_container or self.config.azure.output_container
+        output_blob_uri = self.azure_client.upload_file_to_blob(
+            container_name=container,
+            blob_name=f"segmentations/{mask_filename}",
+            source_path=local_mask_path,
+            content_type="application/gzip",
+        )
+        logger.info("Mask uploaded to Azure Blob: %s", output_blob_uri)
+        return output_blob_uri
+
     def export_mask(
         self,
         mask_array: np.ndarray,
-        reference_image: sitk.Image,
+        reference_image: sitk.Image | VolumetricMetadata,
         metadata: VolumetricMetadata,
         output_container: Optional[str] = None,
         dry_run: bool = False,
@@ -267,29 +368,18 @@ class PipelineOrchestrator:
         Returns:
             Tuple of (local_mask_path, output_blob_uri).
         """
-        clean_uid = re.sub(r"[^\w\-.]", "_", metadata.study_instance_uid or "run")
-        mask_filename = f"mask_{clean_uid}_{int(time.time())}.nii.gz"
-        local_mask_path = self.workspace / "outputs" / mask_filename
-
-        save_mask_as_nifti(
+        mask_filename = self.generate_mask_filename(metadata)
+        local_mask_path = self.mask_writer.write_mask(
             mask_array=mask_array,
-            reference_image=reference_image,
-            output_path=local_mask_path,
+            reference=reference_image,
+            filename=mask_filename,
         )
-
-        output_blob_uri: Optional[str] = None
-        container = output_container or self.config.azure.output_container
-        if not dry_run and self.azure_client.is_connected:
-            output_blob_uri = self.azure_client.upload_file_to_blob(
-                container_name=container,
-                blob_name=f"segmentations/{mask_filename}",
-                source_path=local_mask_path,
-                content_type="application/gzip",
-            )
-            logger.info("Mask uploaded to Azure Blob: %s", output_blob_uri)
-        else:
-            logger.info("Dry-run active or Azure disconnected; skipped mask cloud upload.")
-
+        output_blob_uri = self.upload_mask(
+            local_mask_path=local_mask_path,
+            mask_filename=mask_filename,
+            output_container=output_container,
+            dry_run=dry_run,
+        )
         return local_mask_path, output_blob_uri
 
     def persist_to_database(

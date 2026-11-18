@@ -174,19 +174,19 @@ def run_pipeline(
         if batch_size <= 0:
             raise ValueError(f"batch_size must be a strictly positive integer, got {batch_size}.")
         orientation = validate_orientation_code(orientation)
-        orchestrator = PipelineOrchestrator(config=config)
-        orchestrator.run(
-            blob_path=blob_path,
-            series_prefix=series_prefix,
-            local_input=local_input,
-            input_container=input_container,
-            output_container=output_container,
-            modality=modality,
-            orientation=orientation,
-            checkpoint=checkpoint,
-            batch_size=batch_size,
-            dry_run=dry_run,
-        )
+        with PipelineOrchestrator(config=config) as orchestrator:
+            orchestrator.run(
+                blob_path=blob_path,
+                series_prefix=series_prefix,
+                local_input=local_input,
+                input_container=input_container,
+                output_container=output_container,
+                modality=modality,
+                orientation=orientation,
+                checkpoint=checkpoint,
+                batch_size=batch_size,
+                dry_run=dry_run,
+            )
         return 0
     except Exception as exc:
         logger.error("Pipeline run failed: %s", exc, exc_info=True)
