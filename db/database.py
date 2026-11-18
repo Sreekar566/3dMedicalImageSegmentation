@@ -29,6 +29,11 @@ from medical_segmentation.pipeline.metrics import SegmentationMetrics
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "DatabaseManager",
+    "chunked_iterable",
+]
+
 
 def chunked_iterable(iterable: Iterable[Any], chunk_size: int = 500) -> Generator[List[Any], None, None]:
     """
@@ -87,6 +92,25 @@ class DatabaseManager:
             expire_on_commit=False,
         )
 
+    def dispose(self) -> None:
+        """Dispose of the underlying SQLAlchemy engine and release pooled connections."""
+        if hasattr(self, "engine") and self.engine is not None:
+            try:
+                self.engine.dispose()
+                logger.info("DatabaseManager connection pool successfully disposed.")
+            except Exception as exc:
+                logger.warning("Error while disposing database engine: %s", exc)
+
+    def close(self) -> None:
+        """Alias for dispose() to conform to standard resource lifecycle protocols."""
+        self.dispose()
+
+    def __enter__(self) -> DatabaseManager:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.dispose()
+
     def init_tables(self) -> None:
         """Create all tables in PostgreSQL if they do not already exist."""
         logger.info("Verifying and initializing database schema tables...")
@@ -142,20 +166,26 @@ class DatabaseManager:
         Returns:
             Tuple of (study_id, run_id).
         """
+        raw_sp = tuple(metadata.spacing) if metadata.spacing else ()
+        spacing = (raw_sp + (1.0, 1.0, 1.0))[:3]
+
+        raw_dims = tuple(metadata.dimensions) if metadata.dimensions else ()
+        dims = (raw_dims + (0, 0, 0))[:3]
+
         with self.get_session() as session:
             study = PatientStudy(
-                patient_id=metadata.patient_id,
+                patient_id=metadata.patient_id or "ANONYMOUS",
                 study_instance_uid=metadata.study_instance_uid or f"study_{int(datetime.datetime.now().timestamp())}",
                 series_instance_uid=metadata.series_instance_uid or f"series_{int(datetime.datetime.now().timestamp())}",
-                modality=metadata.modality,
-                body_part=metadata.body_part,
-                spatial_orientation=metadata.spatial_orientation,
-                voxel_spacing_x=metadata.spacing[0],
-                voxel_spacing_y=metadata.spacing[1],
-                voxel_spacing_z=metadata.spacing[2],
-                dimensions_x=metadata.dimensions[0],
-                dimensions_y=metadata.dimensions[1],
-                dimensions_z=metadata.dimensions[2],
+                modality=metadata.modality or "CT",
+                body_part=metadata.body_part or "UNKNOWN",
+                spatial_orientation=metadata.spatial_orientation or "RAS",
+                voxel_spacing_x=float(spacing[0]),
+                voxel_spacing_y=float(spacing[1]),
+                voxel_spacing_z=float(spacing[2]),
+                dimensions_x=int(dims[0]),
+                dimensions_y=int(dims[1]),
+                dimensions_z=int(dims[2]),
             )
             session.add(study)
             session.flush()
@@ -173,6 +203,11 @@ class DatabaseManager:
             session.flush()
 
             for label in metrics.labels:
+                raw_c = tuple(label.centroid_mm) if label.centroid_mm else ()
+                c = (raw_c + (0.0, 0.0, 0.0))[:3]
+
+                raw_b = tuple(label.bounding_box) if label.bounding_box else ()
+                b = (raw_b + (0, 0, 0, 0, 0, 0))[:6]
                 vol_metric = VolumeMetric(
                     run_id=run.id,
                     label_id=label.label_id,
@@ -184,15 +219,15 @@ class DatabaseManager:
                     std_intensity=label.std_intensity,
                     min_intensity=label.min_intensity,
                     max_intensity=label.max_intensity,
-                    centroid_x_mm=label.centroid_mm[0],
-                    centroid_y_mm=label.centroid_mm[1],
-                    centroid_z_mm=label.centroid_mm[2],
-                    bbox_min_x=label.bounding_box[0],
-                    bbox_min_y=label.bounding_box[1],
-                    bbox_min_z=label.bounding_box[2],
-                    bbox_max_x=label.bounding_box[3],
-                    bbox_max_y=label.bounding_box[4],
-                    bbox_max_z=label.bounding_box[5],
+                    centroid_x_mm=float(c[0]),
+                    centroid_y_mm=float(c[1]),
+                    centroid_z_mm=float(c[2]),
+                    bbox_min_x=int(b[0]),
+                    bbox_min_y=int(b[1]),
+                    bbox_min_z=int(b[2]),
+                    bbox_max_x=int(b[3]),
+                    bbox_max_y=int(b[4]),
+                    bbox_max_z=int(b[5]),
                 )
                 session.add(vol_metric)
 
@@ -223,6 +258,8 @@ class DatabaseManager:
         Returns:
             Total number of slice metric rows successfully persisted.
         """
+        if not isinstance(run_id, int) or run_id <= 0:
+            raise ValueError(f"run_id must be a strictly positive integer, got {run_id}.")
         effective_batch_size = self.settings.batch_size if batch_size is None else batch_size
         if effective_batch_size <= 0:
             raise ValueError(f"batch_size must be a strictly positive integer, got {effective_batch_size}.")

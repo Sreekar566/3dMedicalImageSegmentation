@@ -314,12 +314,15 @@ class PipelineOrchestrator:
         effective_batch_size = self.config.db.batch_size if batch_size is None else batch_size
         if effective_batch_size <= 0:
             raise ValueError(f"batch_size must be a strictly positive integer, got {effective_batch_size}.")
+        owns_db = False
+        db: Optional[Any] = None
         try:
             if self.db_manager is not None:
                 db = self.db_manager
             else:
                 from medical_segmentation.db.database import DatabaseManager
                 db = DatabaseManager(self.config.db)
+                owns_db = True
             db.init_tables()
 
             study_id, run_id = db.record_study_and_run(
@@ -343,6 +346,9 @@ class PipelineOrchestrator:
             logger.error("PostgreSQL database persistence failed: %s", exc, exc_info=True)
             logger.warning("Pipeline proceeding despite database persistence failure.")
             return None, None, 0
+        finally:
+            if owns_db and db is not None and hasattr(db, "dispose"):
+                db.dispose()
 
     def run(
         self,

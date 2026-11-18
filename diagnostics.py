@@ -126,6 +126,7 @@ def check_workspace(work_dir: Path | str) -> Dict[str, Any]:
 
 def check_database(settings: Optional[DatabaseSettings] = None) -> Dict[str, Any]:
     """Verify PostgreSQL database connectivity and responsiveness via connection pooling."""
+    db_mgr: Optional[Any] = None
     try:
         from medical_segmentation.config import DatabaseSettings as DefaultDbSettings
         from medical_segmentation.db.database import DatabaseManager
@@ -149,6 +150,9 @@ def check_database(settings: Optional[DatabaseSettings] = None) -> Dict[str, Any
             "status": "error",
             "error": str(exc),
         }
+    finally:
+        if db_mgr is not None and hasattr(db_mgr, "dispose"):
+            db_mgr.dispose()
 
 
 class SystemHealthChecker:

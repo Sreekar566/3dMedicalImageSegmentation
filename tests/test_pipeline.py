@@ -7,6 +7,7 @@ sliding-window inference, metric extraction, and 500-row chunked batch generatio
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import SimpleITK as sitk
@@ -25,7 +26,11 @@ from medical_segmentation.config import (
 from medical_segmentation.db.database import DatabaseManager, chunked_iterable
 from medical_segmentation.io.dicom_loader import DicomVolumeLoader, VolumetricMetadata
 from medical_segmentation.main import main, parse_args, run_pipeline
-from medical_segmentation.pipeline import PipelineOrchestrator, PipelineResult
+from medical_segmentation.pipeline import (
+    PipelineOrchestrator,
+    PipelineResult,
+    SegmentationMetrics,
+)
 from medical_segmentation.pipeline.inference import (
     SlidingWindowInferenceEngine,
     VolumetricMetricsCalculator,
@@ -691,6 +696,36 @@ def test_pipeline_orchestrator_database_persistence() -> None:
     assert study_id is not None
     assert run_id is not None
     assert inserted_count == 4
+
+
+def test_pipeline_orchestrator_database_persistence_disposes_local_manager() -> None:
+    """Verify persist_to_database properly disposes of internally created DatabaseManager."""
+    orchestrator = PipelineOrchestrator(db_manager=None)
+
+    meta = VolumetricMetadata(
+        patient_id="PATIENT_LIFECYCLE",
+        study_instance_uid="STUDY_LIFECYCLE",
+        series_instance_uid="SERIES_LIFECYCLE",
+        dimensions=(8, 8, 8),
+        spacing=(1.0, 1.0, 1.0),
+    )
+    summary = SegmentationMetrics(duration_seconds=0.1)
+
+    mock_db = MagicMock(spec=DatabaseManager)
+    mock_db.record_study_and_run.return_value = (1, 1)
+    mock_db.bulk_insert_slice_metrics.return_value = 0
+
+    with patch("medical_segmentation.db.database.DatabaseManager", return_value=mock_db):
+        study_id, run_id, count = orchestrator.persist_to_database(
+            metadata=meta,
+            summary_metrics=summary,
+            slice_generator=iter([]),
+            dry_run=False,
+        )
+
+        assert study_id == 1
+        assert run_id == 1
+        mock_db.dispose.assert_called_once()
 
 
 def test_main_run_pipeline_cli_wrapper(tmp_path: Path) -> None:

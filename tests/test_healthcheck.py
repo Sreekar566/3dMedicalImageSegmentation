@@ -215,3 +215,12 @@ def test_system_health_checker_class(tmp_path: Path) -> None:
         assert fail_report["status"] == "unhealthy"
         assert fail_report["components"]["monai"]["status"] == "error"
 
+
+def test_check_database_disposes_engine() -> None:
+    """Verify check_database cleans up its DatabaseManager connection pool via dispose()."""
+    with patch("medical_segmentation.db.database.DatabaseManager.check_connection", return_value=True), \
+         patch("medical_segmentation.db.database.DatabaseManager.dispose") as mock_dispose:
+        result = check_database(DatabaseSettings())
+        assert result["status"] == "ok"
+        mock_dispose.assert_called_once()
+

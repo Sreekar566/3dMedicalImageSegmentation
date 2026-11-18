@@ -623,3 +623,99 @@ def test_chunked_iterable_utility_edge_cases() -> None:
         list(chunked_iterable(range(10), chunk_size=0))
     with pytest.raises(ValueError, match="strictly positive integer"):
         list(chunked_iterable(range(10), chunk_size=-5))
+
+
+def test_database_manager_dispose_and_context_manager() -> None:
+    """Verify DatabaseManager.dispose(), close(), and context manager protocol properly manage engine lifecycle."""
+    test_engine = create_engine("sqlite:///:memory:")
+    settings = DatabaseSettings()
+    db = DatabaseManager(settings=settings, engine=test_engine)
+
+    assert db.check_connection() is True
+    db.dispose()
+
+    # Context manager protocol test
+    engine2 = create_engine("sqlite:///:memory:")
+    with DatabaseManager(settings=settings, engine=engine2) as managed_db:
+        assert managed_db.check_connection() is True
+    # Upon context exit, dispose should have been invoked
+    assert managed_db.engine is not None
+
+
+def test_database_manager_record_study_and_run_malformed_metadata_tuples(
+    db_manager: DatabaseManager,
+) -> None:
+    """Verify record_study_and_run safely handles missing or truncated spacing, dimensions, centroid, and bbox."""
+    # Metadata with empty or short tuples that would previously cause IndexError
+    meta = VolumetricMetadata(
+        patient_id="PATIENT_ROBUST",
+        study_instance_uid="1.2.3.4.robust",
+        series_instance_uid="1.2.3.4.robust.1",
+        modality="CT",
+        body_part="CHEST",
+        spatial_orientation="RAS",
+        spacing=(1.5,),  # Len < 3
+        dimensions=(512, 512),  # Len < 3
+    )
+
+    # Label with short centroid and bbox
+    label = LabelSummaryMetric(
+        label_id=1,
+        structure_name="Lesion",
+        voxel_count=100,
+        volume_mm3=500.0,
+        volume_cm3=0.5,
+        mean_intensity=50.0,
+        std_intensity=5.0,
+        min_intensity=10.0,
+        max_intensity=90.0,
+        centroid_mm=(10.0, 20.0),  # Len < 3
+        bounding_box=(0, 0, 0, 10),  # Len < 6
+    )
+
+    metrics = SegmentationMetrics(
+        duration_seconds=2.5,
+        labels=[label],
+    )
+
+    study_id, run_id = db_manager.record_study_and_run(
+        metadata=meta,
+        metrics=metrics,
+        model_name="3D_UNet_Robust",
+        roi_size="(32, 32, 32)",
+        overlap=0.5,
+        device="cpu",
+    )
+
+    assert study_id > 0
+    assert run_id > 0
+
+    with db_manager.get_session() as session:
+        study = session.get(PatientStudy, study_id)
+        assert study is not None
+        assert study.voxel_spacing_x == 1.5
+        assert study.voxel_spacing_y == 1.0  # Safe fallback
+        assert study.voxel_spacing_z == 1.0  # Safe fallback
+        assert study.dimensions_x == 512
+        assert study.dimensions_y == 512
+        assert study.dimensions_z == 0  # Safe fallback
+
+        vol_metrics = session.query(VolumeMetric).filter_by(run_id=run_id).all()
+        assert len(vol_metrics) == 1
+        vm = vol_metrics[0]
+        assert vm.centroid_x_mm == 10.0
+        assert vm.centroid_y_mm == 20.0
+        assert vm.centroid_z_mm == 0.0  # Safe fallback
+        assert vm.bbox_max_y == 0  # Safe fallback
+        assert vm.bbox_max_z == 0  # Safe fallback
+
+
+def test_database_manager_bulk_insert_slice_metrics_invalid_run_id(
+    db_manager: DatabaseManager,
+) -> None:
+    """Verify bulk_insert_slice_metrics rejects non-positive run_id."""
+    with pytest.raises(ValueError, match="run_id must be a strictly positive integer"):
+        db_manager.bulk_insert_slice_metrics(run_id=0, slice_generator=iter([]))
+
+    with pytest.raises(ValueError, match="run_id must be a strictly positive integer"):
+        db_manager.bulk_insert_slice_metrics(run_id=-1, slice_generator=iter([]))
