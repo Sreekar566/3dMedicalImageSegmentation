@@ -39,6 +39,7 @@ services:
       - INFERENCE_DEVICE=cpu
       - WORK_DIR=/tmp/medical_segmentation_workspace
       - LOG_LEVEL=INFO
+      - LOG_FORMAT=text
     volumes:
       - workspace_data:/tmp/medical_segmentation_workspace
     healthcheck:

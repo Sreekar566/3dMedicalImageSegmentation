@@ -387,6 +387,14 @@ class PipelineConfig(BaseSettings):
         default="INFO",
         description="Application logging verbosity: DEBUG, INFO, WARNING, ERROR.",
     )
+    log_format: str = Field(
+        default="text",
+        description="Log output formatting style ('text' or 'json').",
+    )
+    log_file: Path | str | None = Field(
+        default=None,
+        description="Optional local filesystem destination for persistent log records.",
+    )
 
     @field_validator("work_dir", mode="before")
     @classmethod
@@ -408,6 +416,30 @@ class PipelineConfig(BaseSettings):
                 f"Invalid log_level '{v}'. Must be one of: {', '.join(sorted(valid_levels))}."
             )
         return "WARNING" if v_upper == "WARN" else v_upper
+
+    @field_validator("log_format")
+    @classmethod
+    def validate_log_format(cls, v: str) -> str:
+        if not isinstance(v, str):
+            raise TypeError(f"log_format must be a string, got {type(v).__name__}.")
+        v_clean = v.lower().strip()
+        if v_clean not in {"text", "json"}:
+            raise ValueError(f"Invalid log_format '{v}'. Must be 'text' or 'json'.")
+        return v_clean
+
+    @field_validator("log_file", mode="before")
+    @classmethod
+    def validate_log_file(cls, v: Any) -> Path | None:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            cleaned = v.strip()
+            if not cleaned or cleaned.lower() in ("none", "null"):
+                return None
+            return Path(cleaned)
+        if isinstance(v, Path):
+            return v
+        raise TypeError(f"Invalid type for log_file: {type(v).__name__}.")
 
 
 # Global configuration instance

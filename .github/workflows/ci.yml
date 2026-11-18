@@ -39,9 +39,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Run code compilation lint checks
+        run: |
+          make lint
+
       - name: Run system health check
         run: |
           python -m main --check-health
+
+      - name: Run system health check with structured JSON logging
+        run: |
+          python -m main --check-health --log-format json
 
       - name: Run test suite
         run: |

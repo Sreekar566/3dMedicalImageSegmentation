@@ -74,11 +74,14 @@ Designed for automated, high-throughput volumetric processing of 3D CBCT, CT, an
 │   ├── __init__.py
 │   ├── models.py             # Schema definitions for segmentation results and metrics
 │   └── database.py           # Connection pool & 500-row chunked batched insert logic
+├── diagnostics.py            # Isolated diagnostic probes for Python, Torch, SimpleITK, MONAI, and DB
+├── logging_config.py         # Production structured JSON / text logging & contextual formatter
 ├── tests/
 │   ├── __init__.py
 │   ├── test_db.py            # Unit & integration tests for database models and pool
 │   ├── test_healthcheck.py   # System health probe and connectivity tests
 │   ├── test_io.py            # Ingestion and Azure client tests
+│   ├── test_logging.py       # Structured JSON formatting, file logging, and CLI log arguments
 │   └── test_pipeline.py      # Unit tests for transforms, models, metrics, and batching
 ├── Dockerfile                # Production-hardened container definition with healthcheck
 ├── docker-compose.yml        # Orchestrated PostgreSQL 16 & pipeline services
@@ -124,6 +127,11 @@ Designed for automated, high-throughput volumetric processing of 3D CBCT, CT, an
   - Slices records into batches of exactly 500 rows (`chunked_iterable`).
   - Executes direct multi-row `session.execute(insert(VoxelSliceMetric), chunk)`.
   - Commits each batch individually, eliminating key-generation bottlenecks, identity-map overhead, and transaction log bloat.
+
+### 5. Structured JSON & Cloud Logging Telemetry
+- **Cloud-Ready JSON Logs**: Produces single-line JSON log events for cloud ingestion (Azure Monitor, AWS CloudWatch, Datadog, Elastic) with ISO-8601 UTC timestamps, log level, caller module/function/line, process/thread IDs, and contextual metadata.
+- **Traceback Ingestion**: Formats exceptions into a structured `exception` object (`type`, `message`, `traceback`), preventing multi-line stack trace corruption in container log aggregators.
+- **Configurable Outputs**: Supports console stdout (`--log-format text` or `--log-format json`) and persistent file logging (`--log-file /path/to/log.jsonl` or `LOG_FILE` environment variable).
 
 ---
 
@@ -204,6 +212,20 @@ To additionally verify PostgreSQL database connectivity and responsiveness:
 python -m main --check-health --check-db
 ```
 
+### Structured JSON Logging & File Persistence
+
+Run health checks or pipeline execution with structured JSON logs formatted for automated ingestion by cloud aggregators (Azure Monitor, CloudWatch, Datadog):
+
+```bash
+python -m main --check-health --log-format json
+```
+
+Direct log output to a persistent local log file:
+
+```bash
+python -m main --local-input "/path/to/scan.nii.gz" --dry-run --log-file "pipeline.log" --log-format json
+```
+
 ---
 
 ## Docker & Container Deployment
@@ -243,6 +265,8 @@ A `Makefile` is provided for rapid local development workflows:
 make help          # List all available targets
 make install       # Install pinned requirements
 make test          # Execute pytest test suite
+make lint          # Run code verification and syntax compilation checks
+make coverage      # Run pytest test suite with code coverage reporting
 make healthcheck   # Run system diagnostics probe
 make docker-up     # Launch PostgreSQL and pipeline via compose
 make docker-down   # Tear down compose services and networks

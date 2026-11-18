@@ -1,4 +1,4 @@
-.PHONY: help install test lint healthcheck docker-build docker-up docker-down docker-logs clean
+.PHONY: help install test lint coverage healthcheck docker-build docker-up docker-down docker-logs clean
 
 help:  ## Show this help message
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -8,6 +8,13 @@ install:  ## Install Python dependencies
 
 test:  ## Run test suite with pytest
 	pytest -v
+
+lint:  ## Run code verification and syntax compilation checks
+	python -m py_compile main.py config.py diagnostics.py logging_config.py db/*.py io/*.py pipeline/*.py tests/*.py
+
+coverage:  ## Run pytest test suite with code coverage reporting
+	coverage run -m pytest -v
+	coverage report -m
 
 healthcheck:  ## Run local system and dependency health check
 	python -m main --check-health

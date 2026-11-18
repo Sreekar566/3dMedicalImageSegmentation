@@ -25,22 +25,32 @@ from medical_segmentation.diagnostics import (
     check_system_health as _diagnostics_check_system_health,
     run_health_check as _diagnostics_run_health_check,
 )
+from medical_segmentation.logging_config import (
+    StandardTextFormatter,
+    StructuredJsonFormatter,
+    configure_logging,
+    get_logger,
+)
 from medical_segmentation.pipeline import PipelineOrchestrator, PipelineResult
 
 __all__ = [
+    "StandardTextFormatter",
+    "StructuredJsonFormatter",
     "check_system_health",
+    "configure_logging",
+    "get_logger",
     "main",
     "parse_args",
     "run_health_check",
     "run_pipeline",
 ]
 
-logging.basicConfig(
-    level=getattr(logging, config.log_level.upper(), logging.INFO),
-    format="%(asctime)s [%(levelname)s] [%(name)s]: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+configure_logging(
+    level=config.log_level,
+    log_format=config.log_format,
+    log_file=config.log_file,
 )
-logger = logging.getLogger("3dMedicalImageSegmentation.main")
+logger = get_logger("3dMedicalImageSegmentation.main")
 
 
 def parse_args() -> argparse.Namespace:
@@ -117,6 +127,26 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Execute inference and metric extraction without uploading to Azure or PostgreSQL.",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default=config.log_level,
+        choices=["DEBUG", "INFO", "WARNING", "WARN", "ERROR", "CRITICAL"],
+        help="Application logging verbosity (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--log-format",
+        type=str,
+        default=config.log_format,
+        choices=["text", "json"],
+        help="Log output formatting style ('text' or 'json', default: %(default)s).",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=config.log_file,
+        help="Optional destination path for persistent log file.",
     )
 
     return parser.parse_args()
@@ -196,6 +226,16 @@ def run_health_check(
 def main() -> None:
     """CLI entrypoint."""
     args = parse_args()
+    log_level = getattr(args, "log_level", None)
+    log_format = getattr(args, "log_format", None)
+    log_file = getattr(args, "log_file", None)
+    if isinstance(log_level, str) or isinstance(log_format, str) or isinstance(log_file, (str, Path)):
+        configure_logging(
+            level=log_level if isinstance(log_level, str) else config.log_level,
+            log_format=log_format if isinstance(log_format, str) else config.log_format,
+            log_file=log_file if isinstance(log_file, (str, Path)) else config.log_file,
+        )
+
     if getattr(args, "check_health", None) is True:
         check_db = getattr(args, "check_db", None) is True
         sys.exit(run_health_check(check_db=check_db))
