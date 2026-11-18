@@ -1513,4 +1513,104 @@ def test_pipeline_result_properties_and_to_dict(tmp_path: Path) -> None:
     assert res_dry.is_uploaded_to_cloud is False
 
 
+def test_pipeline_orchestrator_enhanced_validation(tmp_path: Path) -> None:
+    """Verify enhanced input validation across orchestrator lifecycle, ingestion, and export."""
+    # 1. Empty workspace path validation
+    with pytest.raises(ValueError, match="workspace cannot be an empty path"):
+        PipelineOrchestrator(workspace="")
+    with pytest.raises(ValueError, match="workspace cannot be an empty path"):
+        PipelineOrchestrator(workspace="   ")
 
+    orchestrator = PipelineOrchestrator(workspace=tmp_path)
+
+    # 2. Ingest volume conflicting sources
+    with pytest.raises(ValueError, match="Conflicting input volume sources"):
+        orchestrator.ingest_volume(local_input=tmp_path, blob_path="vol.nii.gz")
+    with pytest.raises(ValueError, match="Conflicting input volume sources"):
+        orchestrator.ingest_volume(blob_path="vol.nii.gz", series_prefix="prefix/")
+
+    # 3. Ingest volume invalid container name
+    with pytest.raises(ValueError, match="Invalid Azure Blob container name"):
+        orchestrator.ingest_volume(blob_path="vol.nii.gz", input_container="INVALID_CONTAINER")
+
+    # 4. Standardize geometry invalid modality
+    with pytest.raises(ValueError, match="Invalid modality 'INVALID'"):
+        orchestrator.standardize_geometry(target_path=tmp_path, is_dicom_dir=False, modality="INVALID")
+
+    # 5. Upload mask validation
+    with pytest.raises(ValueError, match="mask_filename must be a non-empty string"):
+        orchestrator.upload_mask(local_mask_path=tmp_path / "mask.nii.gz", mask_filename="")
+    with pytest.raises(ValueError, match="Invalid Azure Blob container name"):
+        orchestrator.upload_mask(
+            local_mask_path=tmp_path / "mask.nii.gz",
+            mask_filename="mask.nii.gz",
+            output_container="in--valid",
+        )
+
+    # 6. Export mask invalid output container
+    meta = VolumetricMetadata(study_instance_uid="STUDY_VAL")
+    ref_img = sitk.GetImageFromArray(np.zeros((4, 4, 4), dtype=np.float32))
+    mask_arr = np.zeros((4, 4, 4), dtype=np.uint8)
+    with pytest.raises(ValueError, match="Invalid Azure Blob container name"):
+        orchestrator.export_mask(
+            mask_array=mask_arr,
+            reference_image=ref_img,
+            metadata=meta,
+            output_container="INVALID_OUT",
+        )
+
+    # 7. Run invalid arguments
+    with pytest.raises(ValueError, match="Invalid modality 'INVALID'"):
+        orchestrator.run(local_input=tmp_path, modality="INVALID")
+    with pytest.raises(ValueError, match="batch_size must be a strictly positive integer"):
+        orchestrator.run(local_input=tmp_path, batch_size=0)
+    with pytest.raises(ValueError, match="Invalid Azure Blob container name"):
+        orchestrator.run(local_input=tmp_path, input_container="INVALID_IN")
+    with pytest.raises(ValueError, match="Invalid Azure Blob container name"):
+        orchestrator.run(local_input=tmp_path, output_container="INVALID_OUT")
+
+
+def test_main_run_pipeline_enhanced_validation(tmp_path: Path) -> None:
+    """Verify run_pipeline handles custom config injection, conflicting inputs, and argument validation."""
+    arr = np.zeros((32, 32, 32), dtype=np.float32)
+    img = sitk.GetImageFromArray(arr)
+    vol_path = tmp_path / "test_vol.nii.gz"
+    sitk.WriteImage(img, str(vol_path))
+
+    # 1. Custom config injection
+    custom_cfg = PipelineConfig(
+        inference=InferenceSettings(roi_size=(32, 32, 32), target_spacing=None, device="cpu"),
+        work_dir=tmp_path / "custom_work",
+    )
+    exit_code = run_pipeline(local_input=vol_path, config=custom_cfg, dry_run=True)
+    assert exit_code == 0
+
+    # 2. Conflicting input sources
+    assert run_pipeline(blob_path="a.nii.gz", local_input=vol_path) != 0
+
+    # 3. Invalid modality
+    assert run_pipeline(local_input=vol_path, modality="ULTRASOUND") != 0
+
+    # 4. Invalid input/output container names
+    assert run_pipeline(local_input=vol_path, input_container="INVALID_CONTAINER") != 0
+    assert run_pipeline(local_input=vol_path, output_container="INVALID_CONTAINER") != 0
+
+
+def test_config_enhanced_spacing_and_device() -> None:
+    """Verify NaN/Inf detection in spacing and torch.device support in InferenceSettings."""
+    # 1. NaN and Inf spacing validation
+    with pytest.raises(ValueError, match="strictly positive"):
+        InferenceSettings(target_spacing=(float("nan"), 1.0, 1.0))
+    with pytest.raises(ValueError, match="strictly positive"):
+        InferenceSettings(target_spacing=(float("inf"), 1.0, 1.0))
+
+    # 2. torch.device object support in InferenceSettings
+    dev = torch.device("cpu")
+    cfg = InferenceSettings(device=dev)
+    assert cfg.device == "cpu"
+
+    # 3. validate_azure_container_name empty check
+    with pytest.raises(ValueError, match="Container name cannot be empty"):
+        validate_azure_container_name("")
+    with pytest.raises(ValueError, match="Container name cannot be empty"):
+        validate_azure_container_name("   ")

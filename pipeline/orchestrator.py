@@ -21,6 +21,7 @@ import torch
 from medical_segmentation.config import (
     PipelineConfig,
     config as default_config,
+    validate_azure_container_name,
     validate_orientation_code,
 )
 from medical_segmentation.io.azure_client import AzureBlobClient
@@ -111,7 +112,12 @@ class PipelineOrchestrator:
         self.db_manager = db_manager
         self.inference_engine = inference_engine
         self.metrics_calculator = metrics_calculator or VolumetricMetricsCalculator()
-        self.workspace = Path(workspace or self.config.work_dir).resolve()
+        if workspace is not None:
+            if not str(workspace).strip():
+                raise ValueError("workspace cannot be an empty path.")
+            self.workspace = Path(workspace).resolve()
+        else:
+            self.workspace = Path(self.config.work_dir).resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.mask_writer = mask_writer or VolumetricMaskWriter(
             default_output_dir=self.workspace / "outputs"
@@ -151,44 +157,59 @@ class PipelineOrchestrator:
         Returns:
             Tuple of (resolved_path, is_dicom_dir).
         """
-        container = input_container or self.config.azure.input_container
+        clean_blob = blob_path.strip() if isinstance(blob_path, str) and blob_path.strip() else None
+        clean_prefix = series_prefix.strip() if isinstance(series_prefix, str) and series_prefix.strip() else None
+        clean_local = Path(local_input).resolve() if local_input is not None and str(local_input).strip() else None
 
-        if local_input:
-            target_path = Path(local_input).resolve()
-            if not target_path.exists():
-                raise FileNotFoundError(f"Local input path not found: {target_path}")
-            logger.info("Operating in local mode using path: '%s'", target_path)
-            return target_path, target_path.is_dir()
+        inputs_provided = sum(1 for x in (clean_blob, clean_prefix, clean_local) if x is not None)
+        if inputs_provided == 0:
+            raise ValueError(
+                "No input volume source specified (provide exactly one of local_input, series_prefix, or blob_path)."
+            )
+        if inputs_provided > 1:
+            raise ValueError(
+                "Conflicting input volume sources specified; provide exactly one of local_input, series_prefix, or blob_path."
+            )
 
-        if series_prefix:
+        container = (
+            validate_azure_container_name(input_container)
+            if input_container is not None
+            else self.config.azure.input_container
+        )
+
+        if clean_local is not None:
+            if not clean_local.exists():
+                raise FileNotFoundError(f"Local input path not found: {clean_local}")
+            logger.info("Operating in local mode using path: '%s'", clean_local)
+            return clean_local, clean_local.is_dir()
+
+        if clean_prefix is not None:
             logger.info(
                 "Downloading DICOM series prefix '%s' from container '%s'...",
-                series_prefix,
+                clean_prefix,
                 container,
             )
-            series_dir = self.workspace / "raw_series" / Path(series_prefix).name
+            series_dir = self.workspace / "raw_series" / Path(clean_prefix).name
             self.azure_client.download_series_prefix(
                 container_name=container,
-                prefix=series_prefix,
+                prefix=clean_prefix,
                 destination_dir=series_dir,
             )
             return series_dir, True
 
-        if blob_path:
-            logger.info(
-                "Downloading volume blob '%s' from container '%s'...",
-                blob_path,
-                container,
-            )
-            local_file = self.workspace / "raw_volumes" / Path(blob_path).name
-            self.azure_client.download_blob_to_file(
-                container_name=container,
-                blob_name=blob_path,
-                destination_path=local_file,
-            )
-            return local_file, False
-
-        raise ValueError("No input volume source specified (provide local_input, series_prefix, or blob_path).")
+        assert clean_blob is not None
+        logger.info(
+            "Downloading volume blob '%s' from container '%s'...",
+            clean_blob,
+            container,
+        )
+        local_file = self.workspace / "raw_volumes" / Path(clean_blob).name
+        self.azure_client.download_blob_to_file(
+            container_name=container,
+            blob_name=clean_blob,
+            destination_path=local_file,
+        )
+        return local_file, False
 
     def standardize_geometry(
         self,
@@ -200,6 +221,10 @@ class PipelineOrchestrator:
         """
         Step 2: Load volume and standardize spatial orientation via sitk.DICOMOrient.
         """
+        if not isinstance(modality, str) or modality.upper().strip() not in ("CT", "CBCT", "MRI"):
+            raise ValueError(f"Invalid modality '{modality}'. Must be one of: 'CT', 'CBCT', 'MRI'.")
+        modality_clean = modality.upper().strip()
+
         target_orientation = validate_orientation_code(
             orientation or self.config.inference.target_orientation
         )
@@ -215,7 +240,7 @@ class PipelineOrchestrator:
         else:
             sitk_image, metadata = self.volume_loader.load_volume_file(target_path)
 
-        metadata.modality = modality
+        metadata.modality = modality_clean
         logger.info(
             "Geometry standardized: dimensions=%s, spacing=%s, orientation=%s",
             metadata.dimensions,
@@ -340,14 +365,22 @@ class PipelineOrchestrator:
         Returns:
             Uploaded Azure Blob URI string, or None if skipped.
         """
+        if not isinstance(mask_filename, str) or not mask_filename.strip():
+            raise ValueError("mask_filename must be a non-empty string.")
+
+        container = (
+            validate_azure_container_name(output_container)
+            if output_container is not None
+            else self.config.azure.output_container
+        )
+
         if dry_run or not self.azure_client.is_connected:
             logger.info("Dry-run active or Azure disconnected; skipped mask cloud upload.")
             return None
 
-        container = output_container or self.config.azure.output_container
         output_blob_uri = self.azure_client.upload_file_to_blob(
             container_name=container,
-            blob_name=f"segmentations/{mask_filename}",
+            blob_name=f"segmentations/{mask_filename.strip()}",
             source_path=local_mask_path,
             content_type="application/gzip",
         )
@@ -368,6 +401,9 @@ class PipelineOrchestrator:
         Returns:
             Tuple of (local_mask_path, output_blob_uri).
         """
+        if output_container is not None:
+            validate_azure_container_name(output_container)
+
         mask_filename = self.generate_mask_filename(metadata)
         local_mask_path = self.mask_writer.write_mask(
             mask_array=mask_array,
@@ -457,9 +493,18 @@ class PipelineOrchestrator:
         Execute end-to-end 3D medical segmentation workflow across all 7 stages.
         """
         total_start = time.perf_counter()
+        if not isinstance(modality, str) or modality.upper().strip() not in ("CT", "CBCT", "MRI"):
+            raise ValueError(f"Invalid modality '{modality}'. Must be one of: 'CT', 'CBCT', 'MRI'.")
+        modality_clean = modality.upper().strip()
         target_orientation = validate_orientation_code(
             orientation or self.config.inference.target_orientation
         )
+        if batch_size is not None and batch_size <= 0:
+            raise ValueError(f"batch_size must be a strictly positive integer, got {batch_size}.")
+        if input_container is not None:
+            validate_azure_container_name(input_container)
+        if output_container is not None:
+            validate_azure_container_name(output_container)
 
         logger.info("=== Step 1: Volume Ingestion ===")
         target_path, is_dicom_dir = self.ingest_volume(
@@ -473,12 +518,12 @@ class PipelineOrchestrator:
         sitk_image, metadata = self.standardize_geometry(
             target_path=target_path,
             is_dicom_dir=is_dicom_dir,
-            modality=modality,
+            modality=modality_clean,
             orientation=target_orientation,
         )
 
         logger.info("=== Step 3: MONAI Volumetric Transformation Pipeline ===")
-        volume_tensor = self.prepare_tensor(sitk_image=sitk_image, modality=modality)
+        volume_tensor = self.prepare_tensor(sitk_image=sitk_image, modality=modality_clean)
 
         logger.info("=== Step 4: MONAI 3D Sliding-Window Volumetric Inference ===")
         mask_array, inference_duration = self.execute_inference(

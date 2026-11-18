@@ -1001,3 +1001,51 @@ def test_extract_pydicom_metadata_and_sitk_to_numpy_standalone(tmp_path: Path) -
     assert np.allclose(arr, 42.0)
 
 
+def test_azure_client_enhanced_input_validation(tmp_path: Path) -> None:
+    """Verify AzureBlobClient validates container names, blob names, prefixes, and paths."""
+    client, mock_bsc = _make_connected_client()
+    dummy_file = tmp_path / "dummy.txt"
+    dummy_file.write_text("sample")
+
+    # 1. download_blob_to_stream validation
+    with pytest.raises(ValueError, match="Invalid Azure Blob container name"):
+        client.download_blob_to_stream("INVALID_CONTAINER", "vol.nii.gz")
+    with pytest.raises(ValueError, match="blob_name must be a non-empty string"):
+        client.download_blob_to_stream("valid-container", "")
+    with pytest.raises(ValueError, match="blob_name must be a non-empty string"):
+        client.download_blob_to_stream("valid-container", "   ")
+    with pytest.raises(ValueError, match="blob_name must be a non-empty string"):
+        client.download_blob_to_stream("valid-container", None)  # type: ignore[arg-type]
+
+    # 2. download_blob_to_file validation
+    with pytest.raises(ValueError, match="Invalid Azure Blob container name"):
+        client.download_blob_to_file("in--valid", "vol.nii.gz", tmp_path / "dest.nii.gz")
+    with pytest.raises(ValueError, match="blob_name must be a non-empty string"):
+        client.download_blob_to_file("valid-container", "", tmp_path / "dest.nii.gz")
+    with pytest.raises(ValueError, match="destination_path cannot be empty"):
+        client.download_blob_to_file("valid-container", "vol.nii.gz", "")
+
+    # 3. download_series_prefix validation
+    with pytest.raises(ValueError, match="Invalid Azure Blob container name"):
+        client.download_series_prefix("-invalid", "series/", tmp_path / "dest")
+    with pytest.raises(ValueError, match="prefix must be a non-empty string"):
+        client.download_series_prefix("valid-container", "", tmp_path / "dest")
+    with pytest.raises(ValueError, match="destination_dir cannot be empty"):
+        client.download_series_prefix("valid-container", "series/", "")
+
+    # 4. upload_file_to_blob validation
+    with pytest.raises(ValueError, match="Invalid Azure Blob container name"):
+        client.upload_file_to_blob("invalid-", "blob.txt", dummy_file)
+    with pytest.raises(ValueError, match="blob_name must be a non-empty string"):
+        client.upload_file_to_blob("valid-container", "", dummy_file)
+    with pytest.raises(ValueError, match="source_path cannot be empty"):
+        client.upload_file_to_blob("valid-container", "blob.txt", "")
+
+    # 5. list_blobs validation
+    with pytest.raises(ValueError, match="Invalid Azure Blob container name"):
+        client.list_blobs("INVALID_UPPER")
+    with pytest.raises(TypeError, match="prefix must be a string"):
+        client.list_blobs("valid-container", prefix=123)  # type: ignore[arg-type]
+
+
+

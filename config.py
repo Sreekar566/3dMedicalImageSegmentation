@@ -6,6 +6,7 @@ PostgreSQL database connection pooling, and MONAI 3D sliding-window inference.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import urllib.parse
@@ -69,6 +70,8 @@ def validate_azure_container_name(name: str) -> str:
     if not isinstance(name, str):
         raise TypeError(f"Container name must be a string, got {type(name).__name__}.")
     name_clean = name.strip()
+    if not name_clean:
+        raise ValueError("Container name cannot be empty.")
     if not AZURE_CONTAINER_NAME_REGEX.match(name_clean):
         raise ValueError(
             f"Invalid Azure Blob container name '{name}'. Must be 3-63 lowercase alphanumeric "
@@ -103,7 +106,7 @@ def parse_target_spacing(v: Any) -> Tuple[float, float, float] | None:
             spacing = tuple(float(x) for x in v)
         except (ValueError, TypeError) as exc:
             raise ValueError(f"Target spacing values must be valid floats, got {v}.") from exc
-        if any(s <= 0.0 for s in spacing):
+        if any(not math.isfinite(s) or s <= 0.0 for s in spacing):
             raise ValueError(f"Target spacing dimensions must be strictly positive (> 0.0), got {spacing}.")
         return spacing
     raise TypeError(f"Invalid type for target_spacing: {type(v).__name__}.")
@@ -322,7 +325,7 @@ class InferenceSettings(BaseSettings):
         default=None,
         description="Path to pre-trained PyTorch 3D U-Net checkpoint (.pt or .pth).",
     )
-    device: str = Field(
+    device: str | torch.device = Field(
         default="cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu",
         description="Execution device: 'cuda', 'mps', or 'cpu'.",
     )
@@ -356,9 +359,11 @@ class InferenceSettings(BaseSettings):
 
     @field_validator("device")
     @classmethod
-    def validate_device(cls, v: str) -> str:
+    def validate_device(cls, v: Any) -> str:
+        if isinstance(v, torch.device):
+            return str(v)
         if not isinstance(v, str):
-            raise TypeError(f"Execution device must be a string, got {type(v).__name__}.")
+            raise TypeError(f"Execution device must be a string or torch.device, got {type(v).__name__}.")
         v_clean = v.lower().strip()
         try:
             torch.device(v_clean)
@@ -371,6 +376,7 @@ class PipelineConfig(BaseSettings):
     """Master pipeline configuration combining Azure, DB, and Inference settings."""
 
     model_config = SettingsConfigDict(
+        env_nested_delimiter="__",
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",

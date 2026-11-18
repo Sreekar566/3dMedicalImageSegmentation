@@ -20,7 +20,13 @@ if "medical_segmentation" not in sys.modules:
     med_pkg.__path__ = [str(Path(__file__).resolve().parent)]
     sys.modules["medical_segmentation"] = med_pkg
 
-from medical_segmentation.config import PipelineConfig, config, validate_orientation_code
+from medical_segmentation.config import (
+    PipelineConfig,
+    config,
+    validate_azure_container_name,
+    validate_orientation_code,
+)
+default_config = config
 from medical_segmentation.diagnostics import (
     check_system_health as _diagnostics_check_system_health,
     run_health_check as _diagnostics_run_health_check,
@@ -155,14 +161,15 @@ def parse_args() -> argparse.Namespace:
 def run_pipeline(
     blob_path: Optional[str] = None,
     series_prefix: Optional[str] = None,
-    local_input: Optional[Path] = None,
+    local_input: Optional[Path | str] = None,
     input_container: Optional[str] = None,
     output_container: Optional[str] = None,
     modality: str = "CT",
     orientation: str = "RAS",
-    checkpoint: Optional[Path] = None,
+    checkpoint: Optional[Path | str] = None,
     batch_size: int = 500,
     dry_run: bool = False,
+    config: Optional[PipelineConfig] = None,
 ) -> int:
     """
     Execute the end-to-end 3D medical segmentation workflow.
@@ -174,11 +181,35 @@ def run_pipeline(
         if batch_size <= 0:
             raise ValueError(f"batch_size must be a strictly positive integer, got {batch_size}.")
         orientation = validate_orientation_code(orientation)
-        with PipelineOrchestrator(config=config) as orchestrator:
+        if not isinstance(modality, str) or modality.upper().strip() not in ("CT", "CBCT", "MRI"):
+            raise ValueError(f"Invalid modality '{modality}'. Must be one of: 'CT', 'CBCT', 'MRI'.")
+        modality = modality.upper().strip()
+
+        if input_container is not None:
+            validate_azure_container_name(input_container)
+        if output_container is not None:
+            validate_azure_container_name(output_container)
+
+        clean_blob = blob_path.strip() if isinstance(blob_path, str) and blob_path.strip() else None
+        clean_prefix = series_prefix.strip() if isinstance(series_prefix, str) and series_prefix.strip() else None
+        clean_local = Path(local_input).resolve() if local_input is not None and str(local_input).strip() else None
+
+        inputs_provided = sum(1 for x in (clean_blob, clean_prefix, clean_local) if x is not None)
+        if inputs_provided == 0:
+            raise ValueError(
+                "No input volume source specified (provide exactly one of local_input, series_prefix, or blob_path)."
+            )
+        if inputs_provided > 1:
+            raise ValueError(
+                "Conflicting input volume sources specified; provide exactly one of local_input, series_prefix, or blob_path."
+            )
+
+        active_config = config or default_config
+        with PipelineOrchestrator(config=active_config) as orchestrator:
             orchestrator.run(
-                blob_path=blob_path,
-                series_prefix=series_prefix,
-                local_input=local_input,
+                blob_path=clean_blob,
+                series_prefix=clean_prefix,
+                local_input=clean_local,
                 input_container=input_container,
                 output_container=output_container,
                 modality=modality,

@@ -13,7 +13,7 @@ from typing import Any, List, Optional
 from azure.core.exceptions import AzureError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
-from medical_segmentation.config import AzureStorageSettings
+from medical_segmentation.config import AzureStorageSettings, validate_azure_container_name
 
 logger = logging.getLogger(__name__)
 
@@ -64,14 +64,19 @@ class AzureBlobClient:
         Returns:
             io.BytesIO containing the raw binary volume payload.
         """
+        valid_container = validate_azure_container_name(container_name)
+        if not isinstance(blob_name, str) or not blob_name.strip():
+            raise ValueError("blob_name must be a non-empty string.")
+        clean_blob_name = blob_name.strip()
+
         if not self.is_connected:
             raise RuntimeError("Azure Blob Client is not connected to a live storage account.")
 
-        logger.info("Streaming blob 'az://%s/%s' into memory...", container_name, blob_name)
+        logger.info("Streaming blob 'az://%s/%s' into memory...", valid_container, clean_blob_name)
         stream = io.BytesIO()
         try:
-            container_client = self._client.get_container_client(container_name)
-            blob_client = container_client.get_blob_client(blob_name)
+            container_client = self._client.get_container_client(valid_container)
+            blob_client = container_client.get_blob_client(clean_blob_name)
             download_stream = blob_client.download_blob(
                 max_concurrency=self.settings.max_concurrency,
                 timeout=self.settings.timeout_seconds,
@@ -79,14 +84,14 @@ class AzureBlobClient:
             download_stream.readinto(stream)
             stream.seek(0)
             logger.info(
-                "Successfully streamed blob '%s' (%d bytes).", blob_name, stream.getbuffer().nbytes
+                "Successfully streamed blob '%s' (%d bytes).", clean_blob_name, stream.getbuffer().nbytes
             )
             return stream
         except ResourceNotFoundError:
-            logger.error("Blob '%s' not found in container '%s'.", blob_name, container_name)
+            logger.error("Blob '%s' not found in container '%s'.", clean_blob_name, valid_container)
             raise
         except AzureError as exc:
-            logger.error("Azure Storage error while streaming blob '%s': %s", blob_name, exc)
+            logger.error("Azure Storage error while streaming blob '%s': %s", clean_blob_name, exc)
             raise
 
     def download_blob_to_file(
@@ -103,16 +108,23 @@ class AzureBlobClient:
             blob_name: Source blob path.
             destination_path: Local destination path (Path or str).
         """
+        valid_container = validate_azure_container_name(container_name)
+        if not isinstance(blob_name, str) or not blob_name.strip():
+            raise ValueError("blob_name must be a non-empty string.")
+        clean_blob_name = blob_name.strip()
+        if not destination_path or not str(destination_path).strip():
+            raise ValueError("destination_path cannot be empty.")
+
         if not self.is_connected:
             raise RuntimeError("Azure Blob Client is not connected to a live storage account.")
 
         dest_path = Path(destination_path).resolve()
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        logger.info("Downloading 'az://%s/%s' -> '%s'...", container_name, blob_name, dest_path)
+        logger.info("Downloading 'az://%s/%s' -> '%s'...", valid_container, clean_blob_name, dest_path)
 
         try:
-            container_client = self._client.get_container_client(container_name)
-            blob_client = container_client.get_blob_client(blob_name)
+            container_client = self._client.get_container_client(valid_container)
+            blob_client = container_client.get_blob_client(clean_blob_name)
             with open(dest_path, "wb") as f:
                 blob_data = blob_client.download_blob(
                     max_concurrency=self.settings.max_concurrency,
@@ -123,7 +135,7 @@ class AzureBlobClient:
             logger.info("Download complete: '%s' (%.2f MB)", dest_path, dest_path.stat().st_size / (1024 * 1024))
             return dest_path
         except AzureError as exc:
-            logger.error("Failed downloading blob '%s': %s", blob_name, exc)
+            logger.error("Failed downloading blob '%s': %s", clean_blob_name, exc)
             raise
 
     def download_series_prefix(
@@ -143,23 +155,30 @@ class AzureBlobClient:
         Returns:
             List of Path objects for downloaded DICOM slice files.
         """
+        valid_container = validate_azure_container_name(container_name)
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise ValueError("prefix must be a non-empty string.")
+        clean_prefix = prefix.strip()
+        if not destination_dir or not str(destination_dir).strip():
+            raise ValueError("destination_dir cannot be empty.")
+
         if not self.is_connected:
             raise RuntimeError("Azure Blob Client is not connected to a live storage account.")
 
         dest_dir = Path(destination_dir).resolve()
         dest_dir.mkdir(parents=True, exist_ok=True)
-        logger.info("Downloading DICOM series from prefix 'az://%s/%s' into '%s'...", container_name, prefix, dest_dir)
+        logger.info("Downloading DICOM series from prefix 'az://%s/%s' into '%s'...", valid_container, clean_prefix, dest_dir)
 
         downloaded_files: List[Path] = []
         try:
-            container_client = self._client.get_container_client(container_name)
-            blobs = list(container_client.list_blobs(name_starts_with=prefix))
+            container_client = self._client.get_container_client(valid_container)
+            blobs = list(container_client.list_blobs(name_starts_with=clean_prefix))
 
             if not blobs:
-                logger.warning("No blobs found under prefix '%s' in container '%s'.", prefix, container_name)
+                logger.warning("No blobs found under prefix '%s' in container '%s'.", clean_prefix, valid_container)
                 return []
 
-            logger.info("Found %d slice blobs under prefix '%s'. Starting concurrent download.", len(blobs), prefix)
+            logger.info("Found %d slice blobs under prefix '%s'. Starting concurrent download.", len(blobs), clean_prefix)
 
             def _download_single_blob(blob_item: Any) -> Path:
                 filename = Path(blob_item.name).name
@@ -179,7 +198,7 @@ class AzureBlobClient:
             logger.info("Successfully downloaded %d DICOM slices to '%s'.", len(downloaded_files), dest_dir)
             return downloaded_files
         except AzureError as exc:
-            logger.error("Failed downloading DICOM series prefix '%s': %s", prefix, exc)
+            logger.error("Failed downloading DICOM series prefix '%s': %s", clean_prefix, exc)
             raise
 
     def upload_file_to_blob(
@@ -203,6 +222,13 @@ class AzureBlobClient:
         Returns:
             The complete Azure Blob URI string.
         """
+        valid_container = validate_azure_container_name(container_name)
+        if not isinstance(blob_name, str) or not blob_name.strip():
+            raise ValueError("blob_name must be a non-empty string.")
+        clean_blob_name = blob_name.strip()
+        if not source_path or not str(source_path).strip():
+            raise ValueError("source_path cannot be empty.")
+
         if not self.is_connected:
             raise RuntimeError("Azure Blob Client is not connected to a live storage account.")
 
@@ -210,14 +236,14 @@ class AzureBlobClient:
         if not src_path.is_file():
             raise FileNotFoundError(f"Source file not found for upload: {src_path}")
 
-        logger.info("Uploading '%s' -> 'az://%s/%s'...", src_path, container_name, blob_name)
+        logger.info("Uploading '%s' -> 'az://%s/%s'...", src_path, valid_container, clean_blob_name)
         try:
-            container_client = self._client.get_container_client(container_name)
+            container_client = self._client.get_container_client(valid_container)
             if not container_client.exists():
-                logger.info("Container '%s' does not exist. Creating container...", container_name)
+                logger.info("Container '%s' does not exist. Creating container...", valid_container)
                 container_client.create_container()
 
-            blob_client = container_client.get_blob_client(blob_name)
+            blob_client = container_client.get_blob_client(clean_blob_name)
             with open(src_path, "rb") as data:
                 blob_client.upload_blob(
                     data=data,
@@ -237,11 +263,14 @@ class AzureBlobClient:
 
     def list_blobs(self, container_name: str, prefix: str = "") -> List[str]:
         """List all blob paths under an optional prefix."""
+        valid_container = validate_azure_container_name(container_name)
+        if not isinstance(prefix, str):
+            raise TypeError(f"prefix must be a string, got {type(prefix).__name__}.")
         if not self.is_connected:
             return []
         try:
-            container_client = self._client.get_container_client(container_name)
+            container_client = self._client.get_container_client(valid_container)
             return [b.name for b in container_client.list_blobs(name_starts_with=prefix)]
         except AzureError as exc:
-            logger.error("Failed listing blobs in container '%s': %s", container_name, exc)
+            logger.error("Failed listing blobs in container '%s': %s", valid_container, exc)
             raise
