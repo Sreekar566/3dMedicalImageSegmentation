@@ -6,15 +6,16 @@ PostgreSQL database connection pooling, and MONAI 3D sliding-window inference.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
 import urllib.parse
 from pathlib import Path
-from typing import Any, Literal, Tuple, Union
+from typing import Any, Dict, Literal, Sequence, Tuple, Union
 
 import torch
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 __all__ = [
@@ -102,6 +103,8 @@ def parse_target_spacing(v: Any) -> Tuple[float, float, float] | None:
     if isinstance(v, (list, tuple)):
         if len(v) != 3:
             raise ValueError(f"Target spacing must have exactly 3 dimensions (dx, dy, dz), got {len(v)} elements.")
+        if any(isinstance(x, bool) for x in v):
+            raise TypeError("Target spacing dimensions cannot be boolean values.")
         try:
             spacing = tuple(float(x) for x in v)
         except (ValueError, TypeError) as exc:
@@ -130,7 +133,12 @@ def parse_roi_size(v: Any) -> Tuple[int, int, int]:
     if isinstance(v, (list, tuple)):
         if len(v) != 3:
             raise ValueError(f"ROI size must have exactly 3 dimensions (depth, height, width), got {len(v)} elements.")
+        if any(isinstance(x, bool) for x in v):
+            raise TypeError("ROI size dimensions cannot be boolean values.")
         try:
+            for x in v:
+                if isinstance(x, float) and not x.is_integer():
+                    raise ValueError(f"ROI size dimensions must be integers, got float {x}.")
             roi = tuple(int(x) for x in v)
         except (ValueError, TypeError) as exc:
             raise ValueError(f"ROI size values must be valid integers, got {v}.") from exc
@@ -150,9 +158,10 @@ def parse_model_checkpoint_path(v: Any) -> Path | None:
             return None
         return Path(cleaned)
     if isinstance(v, Path):
-        if str(v) in ("", "."):
+        cleaned_str = str(v).strip()
+        if not cleaned_str or cleaned_str in (".", "none", "null"):
             return None
-        return v
+        return Path(cleaned_str)
     raise TypeError(f"Invalid type for model_checkpoint_path: {type(v).__name__}.")
 
 
@@ -196,6 +205,15 @@ class AzureStorageSettings(BaseSettings):
         ge=1,
         description="Timeout for blob transfer operations.",
     )
+
+    @field_validator("account_name", "account_key", "connection_string", mode="before")
+    @classmethod
+    def strip_credentials(cls, v: Any) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v.strip()
+        return str(v)
 
     @field_validator("input_container", "output_container")
     @classmethod
@@ -263,14 +281,26 @@ class DatabaseSettings(BaseSettings):
         description="Chunk size for batched bulk inserts into PostgreSQL to avoid OOM.",
     )
 
+    @field_validator("host", "name", "user")
+    @classmethod
+    def validate_non_empty_strings(cls, v: Any, info: ValidationInfo) -> str:
+        if not isinstance(v, str):
+            raise TypeError(f"{info.field_name} must be a string, got {type(v).__name__}.")
+        cleaned = v.strip()
+        if not cleaned:
+            raise ValueError(f"Database {info.field_name} cannot be empty or whitespace only.")
+        return cleaned
+
     @property
     def connection_url(self) -> str:
         """Construct the psycopg2 connection URL with required Azure SSL parameters."""
-        encoded_user = urllib.parse.quote_plus(self.user)
+        encoded_user = urllib.parse.quote_plus(self.user.strip())
         encoded_password = urllib.parse.quote_plus(self.password)
+        encoded_host = self.host.strip()
+        encoded_name = urllib.parse.quote_plus(self.name.strip())
         return (
             f"postgresql+psycopg2://{encoded_user}:{encoded_password}@"
-            f"{self.host}:{self.port}/{self.name}?sslmode={self.sslmode}"
+            f"{encoded_host}:{self.port}/{encoded_name}?sslmode={self.sslmode}"
         )
 
 
@@ -292,11 +322,11 @@ class InferenceSettings(BaseSettings):
         default="RAS",
         description="Target spatial orientation code for SimpleITK DICOMOrient (e.g. 'RAS', 'LPS').",
     )
-    target_spacing: Tuple[float, float, float] | str | None = Field(
+    target_spacing: Tuple[float, float, float] | Sequence[float] | str | None = Field(
         default=(1.0, 1.0, 1.0),
         description="Target voxel spacing in mm (x, y, z). Set to None to keep native acquisition spacing.",
     )
-    roi_size: Tuple[int, int, int] | str = Field(
+    roi_size: Tuple[int, int, int] | Sequence[int] | str = Field(
         default=(96, 96, 96),
         description="Volumetric sub-patch ROI size for sliding-window inference (depth, height, width).",
     )
@@ -446,6 +476,84 @@ class PipelineConfig(BaseSettings):
         if isinstance(v, Path):
             return v
         raise TypeError(f"Invalid type for log_file: {type(v).__name__}.")
+
+    @classmethod
+    def from_file(cls, path: Path | str) -> PipelineConfig:
+        """
+        Load and validate pipeline configuration from a JSON configuration file.
+
+        Args:
+            path: Local filesystem path to a JSON configuration file.
+
+        Returns:
+            Validated PipelineConfig instance.
+
+        Raises:
+            FileNotFoundError: If the configuration file does not exist.
+            ValueError: If the file is not valid JSON or not a JSON dictionary/object.
+            TypeError: If the path parameter is not a string or Path.
+            ValidationError: If the configuration parameters fail schema validation.
+        """
+        if not isinstance(path, (str, Path)):
+            raise TypeError(f"path must be a string or Path, got {type(path).__name__}.")
+        clean_path_str = str(path).strip()
+        if not clean_path_str:
+            raise ValueError("Configuration file path cannot be empty.")
+        resolved_path = Path(clean_path_str).resolve()
+        if not resolved_path.is_file():
+            raise FileNotFoundError(f"Configuration file not found: {resolved_path}")
+
+        try:
+            with open(resolved_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON configuration in '{resolved_path}': {exc}") from exc
+
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Configuration JSON in '{resolved_path}' must be an object/dictionary, got {type(data).__name__}."
+            )
+        return cls.from_dict(data)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> PipelineConfig:
+        """
+        Construct and validate PipelineConfig from a dictionary payload.
+
+        Args:
+            data: Configuration dictionary with optional nested 'azure', 'db', and 'inference' sections.
+
+        Returns:
+            Validated PipelineConfig instance.
+        """
+        if not isinstance(data, dict):
+            raise TypeError(f"Configuration data must be a dictionary, got {type(data).__name__}.")
+        return cls.model_validate(data)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Export strongly-typed configuration to a JSON-serializable dictionary."""
+        return self.model_dump(mode="json")
+
+    def to_file(self, path: Path | str) -> Path:
+        """
+        Serialize and export configuration to a JSON file.
+
+        Args:
+            path: Destination file path.
+
+        Returns:
+            Resolved Path of the saved configuration file.
+        """
+        if not isinstance(path, (str, Path)):
+            raise TypeError(f"path must be a string or Path, got {type(path).__name__}.")
+        clean_path_str = str(path).strip()
+        if not clean_path_str:
+            raise ValueError("Destination file path cannot be empty.")
+        resolved_path = Path(clean_path_str).resolve()
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(resolved_path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, indent=2)
+        return resolved_path
 
 
 # Global configuration instance

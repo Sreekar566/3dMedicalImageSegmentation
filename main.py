@@ -12,7 +12,7 @@ import sys
 import time
 import types
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 # Ensure 'medical_segmentation' module namespace is resolvable
 if "medical_segmentation" not in sys.modules:
@@ -60,7 +60,7 @@ configure_logging(
 logger = get_logger("3dMedicalImageSegmentation.main")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse command-line arguments for the segmentation pipeline."""
     parser = argparse.ArgumentParser(
         description="3D Medical Image Volumetric Segmentation & Cloud Ingestion Pipeline"
@@ -88,6 +88,12 @@ def parse_args() -> argparse.Namespace:
         help="Perform diagnostic system and dependency health check and exit.",
     )
 
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Optional path to a JSON configuration file to initialize pipeline settings.",
+    )
     parser.add_argument(
         "--check-db",
         action="store_true",
@@ -250,33 +256,44 @@ def run_health_check(
 def main() -> None:
     """CLI entrypoint."""
     args = parse_args()
+    config_file = getattr(args, "config", None)
+    active_config = config
+    has_custom_config = False
+    if isinstance(config_file, (str, Path)):
+        active_config = PipelineConfig.from_file(config_file)
+        has_custom_config = True
+
     log_level = getattr(args, "log_level", None)
     log_format = getattr(args, "log_format", None)
     log_file = getattr(args, "log_file", None)
     if isinstance(log_level, str) or isinstance(log_format, str) or isinstance(log_file, (str, Path)):
         configure_logging(
-            level=log_level if isinstance(log_level, str) else config.log_level,
-            log_format=log_format if isinstance(log_format, str) else config.log_format,
-            log_file=log_file if isinstance(log_file, (str, Path)) else config.log_file,
+            level=log_level if isinstance(log_level, str) else active_config.log_level,
+            log_format=log_format if isinstance(log_format, str) else active_config.log_format,
+            log_file=log_file if isinstance(log_file, (str, Path)) else active_config.log_file,
         )
 
     if getattr(args, "check_health", None) is True:
         check_db = getattr(args, "check_db", None) is True
+        if has_custom_config:
+            sys.exit(run_health_check(check_db=check_db, config=active_config))
         sys.exit(run_health_check(check_db=check_db))
-    sys.exit(
-        run_pipeline(
-            blob_path=args.blob_path,
-            series_prefix=args.series_prefix,
-            local_input=args.local_input,
-            input_container=args.container,
-            output_container=args.output_container,
-            modality=args.modality,
-            orientation=args.orientation,
-            checkpoint=args.checkpoint,
-            batch_size=args.batch_size,
-            dry_run=args.dry_run,
-        )
-    )
+
+    kwargs: Dict[str, Any] = {
+        "blob_path": args.blob_path,
+        "series_prefix": args.series_prefix,
+        "local_input": args.local_input,
+        "input_container": args.container,
+        "output_container": args.output_container,
+        "modality": args.modality,
+        "orientation": args.orientation,
+        "checkpoint": args.checkpoint,
+        "batch_size": args.batch_size,
+        "dry_run": args.dry_run,
+    }
+    if has_custom_config:
+        kwargs["config"] = active_config
+    sys.exit(run_pipeline(**kwargs))
 
 
 if __name__ == "__main__":

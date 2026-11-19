@@ -20,6 +20,9 @@ from medical_segmentation.config import (
     DatabaseSettings,
     InferenceSettings,
     PipelineConfig,
+    parse_model_checkpoint_path,
+    parse_roi_size,
+    parse_target_spacing,
     validate_azure_container_name,
     validate_orientation_code,
 )
@@ -1637,4 +1640,176 @@ def test_pipeline_orchestrator_volume_ingester_injection(tmp_path: Path) -> None
         local_input=None,
         input_container=None,
     )
+
+
+def test_pipeline_config_from_file_and_dict_lifecycle(tmp_path: Path) -> None:
+    """Verify PipelineConfig from_file, from_dict, to_dict, and to_file methods."""
+    # 1. to_dict serialization
+    cfg = PipelineConfig()
+    cfg_dict = cfg.to_dict()
+    assert isinstance(cfg_dict, dict)
+    assert "azure" in cfg_dict
+    assert "db" in cfg_dict
+    assert "inference" in cfg_dict
+    assert list(cfg_dict["inference"]["roi_size"]) == [96, 96, 96]
+
+    # 2. to_file and from_file roundtrip
+    out_json = tmp_path / "saved_config.json"
+    written_path = cfg.to_file(out_json)
+    assert written_path == out_json
+    assert out_json.is_file()
+
+    loaded_cfg = PipelineConfig.from_file(out_json)
+    assert loaded_cfg.log_level == cfg.log_level
+    assert loaded_cfg.inference.modality == cfg.inference.modality
+    assert loaded_cfg.work_dir == cfg.work_dir
+
+    # 3. from_dict with partial nested configurations
+    custom_dict = {
+        "inference": {
+            "modality": "MRI",
+            "target_orientation": "LPS",
+            "target_spacing": [1.5, 1.5, 2.5],
+            "roi_size": [64, 64, 64],
+        },
+        "log_level": "DEBUG",
+    }
+    dict_cfg = PipelineConfig.from_dict(custom_dict)
+    assert dict_cfg.inference.modality == "MRI"
+    assert dict_cfg.inference.target_orientation == "LPS"
+    assert dict_cfg.inference.target_spacing == (1.5, 1.5, 2.5)
+    assert dict_cfg.inference.roi_size == (64, 64, 64)
+    assert dict_cfg.log_level == "DEBUG"
+
+    # 4. Error handling: non-existent file
+    with pytest.raises(FileNotFoundError, match="Configuration file not found"):
+        PipelineConfig.from_file(tmp_path / "missing.json")
+
+    # 5. Error handling: empty path
+    with pytest.raises(ValueError, match="Configuration file path cannot be empty"):
+        PipelineConfig.from_file("")
+    with pytest.raises(TypeError, match="path must be a string or Path"):
+        PipelineConfig.from_file(12345)  # type: ignore[arg-type]
+
+    # 6. Error handling: to_file empty path
+    with pytest.raises(ValueError, match="Destination file path cannot be empty"):
+        cfg.to_file("")
+    with pytest.raises(TypeError, match="path must be a string or Path"):
+        cfg.to_file(None)  # type: ignore[arg-type]
+
+    # 7. Error handling: malformed JSON syntax
+    bad_json = tmp_path / "corrupted.json"
+    bad_json.write_text("{invalid_json: true", encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid JSON configuration"):
+        PipelineConfig.from_file(bad_json)
+
+    # 8. Error handling: JSON root is not an object/dictionary
+    array_json = tmp_path / "array.json"
+    array_json.write_text("[1, 2, 3]", encoding="utf-8")
+    with pytest.raises(ValueError, match="must be an object/dictionary"):
+        PipelineConfig.from_file(array_json)
+
+    # 9. Error handling: non-dict data in from_dict
+    with pytest.raises(TypeError, match="Configuration data must be a dictionary"):
+        PipelineConfig.from_dict(["not", "a", "dict"])  # type: ignore[arg-type]
+
+
+def test_enhanced_input_validation_and_type_checks() -> None:
+    """Verify input validation rules for target spacing, ROI size, checkpoint path, and DB credentials."""
+    # 1. Target spacing rejects boolean elements
+    with pytest.raises(TypeError, match="Target spacing dimensions cannot be boolean"):
+        parse_target_spacing((True, 1.0, 1.0))
+    with pytest.raises(TypeError, match="Target spacing dimensions cannot be boolean"):
+        parse_target_spacing([1.0, False, 1.0])
+
+    # 2. ROI size rejects boolean elements and non-integer floats
+    with pytest.raises(TypeError, match="ROI size dimensions cannot be boolean"):
+        parse_roi_size((True, 96, 96))
+    with pytest.raises(TypeError, match="ROI size dimensions cannot be boolean"):
+        parse_roi_size([96, False, 96])
+    with pytest.raises(ValueError, match="ROI size values must be valid integers"):
+        parse_roi_size((96.5, 96.0, 96.0))
+    # Valid float representations of integers are accepted
+    assert parse_roi_size((96.0, 96.0, 96.0)) == (96, 96, 96)
+
+    # 3. Model checkpoint path normalization
+    assert parse_model_checkpoint_path(Path("   ")) is None
+    assert parse_model_checkpoint_path("   ") is None
+    assert parse_model_checkpoint_path(Path("valid_model.pt")) == Path("valid_model.pt")
+
+    # 4. DatabaseSettings rejects empty or whitespace-only host, name, user
+    with pytest.raises(ValidationError):
+        DatabaseSettings(host="   ")
+    with pytest.raises(ValidationError):
+        DatabaseSettings(name="   ")
+    with pytest.raises(ValidationError):
+        DatabaseSettings(user="   ")
+
+    # 5. AzureStorageSettings strips credentials
+    az_cfg = AzureStorageSettings(
+        account_name="  myaccount  ",
+        account_key="  mysecretkey  ",
+        connection_string="  AccountName=myaccount  ",
+    )
+    assert az_cfg.account_name == "myaccount"
+    assert az_cfg.account_key == "mysecretkey"
+    assert az_cfg.connection_string == "AccountName=myaccount"
+
+
+def test_cli_config_argument_and_main_dispatch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Verify CLI --config option is parsed and loaded in parse_args and main()."""
+    cfg_file = tmp_path / "custom_cli_config.json"
+    custom_cfg = PipelineConfig(
+        inference=InferenceSettings(modality="MRI", roi_size=(64, 64, 64)),
+        log_level="DEBUG",
+    )
+    custom_cfg.to_file(cfg_file)
+
+    vol_file = tmp_path / "vol.nii.gz"
+    vol_file.touch()
+
+    # 1. parse_args with --config
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "--local-input",
+            str(vol_file),
+            "--config",
+            str(cfg_file),
+        ],
+    )
+    parsed = parse_args()
+    assert parsed.config == cfg_file
+    assert parsed.local_input == vol_file
+
+    # 2. main() with --config dispatches to run_pipeline with custom config
+    with patch("medical_segmentation.main.run_pipeline", return_value=0) as mock_run:
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 0
+        mock_run.assert_called_once()
+        _, kwargs = mock_run.call_args
+        assert "config" in kwargs
+        assert kwargs["config"].inference.modality == "MRI"
+        assert kwargs["config"].inference.roi_size == (64, 64, 64)
+
+    # 3. main() with --config and --check-health
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "--check-health",
+            "--config",
+            str(cfg_file),
+        ],
+    )
+    with patch("medical_segmentation.main.run_health_check", return_value=0) as mock_health:
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 0
+        mock_health.assert_called_once()
+        _, health_kwargs = mock_health.call_args
+        assert health_kwargs.get("config") is not None
+        assert health_kwargs["config"].inference.modality == "MRI"
 
