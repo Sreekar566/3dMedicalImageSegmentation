@@ -25,14 +25,176 @@ from medical_segmentation.db.models import (
     VoxelSliceMetric,
 )
 from medical_segmentation.io.dicom_loader import VolumetricMetadata
-from medical_segmentation.pipeline.metrics import SegmentationMetrics
+from medical_segmentation.pipeline.metrics import LabelSummaryMetric, SegmentationMetrics
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "DatabaseManager",
+    "build_patient_study",
+    "build_segmentation_run",
+    "build_volume_metric",
+    "build_volume_metrics",
     "chunked_iterable",
 ]
+
+
+def build_patient_study(
+    metadata: VolumetricMetadata,
+    timestamp: Optional[int] = None,
+) -> PatientStudy:
+    """
+    Construct a validated PatientStudy ORM model from VolumetricMetadata.
+    Safely normalizes voxel spacing, volume dimensions, and clinical identifiers.
+
+    Args:
+        metadata: Volumetric clinical and geometric metadata.
+        timestamp: Optional epoch timestamp for fallback UID generation.
+
+    Returns:
+        Instantiated PatientStudy model.
+    """
+    if metadata is None:
+        raise TypeError("metadata must be a VolumetricMetadata instance, got None.")
+
+    raw_sp = tuple(metadata.spacing) if getattr(metadata, "spacing", None) else ()
+    spacing = (raw_sp + (1.0, 1.0, 1.0))[:3]
+
+    raw_dims = tuple(metadata.dimensions) if getattr(metadata, "dimensions", None) else ()
+    dims = (raw_dims + (0, 0, 0))[:3]
+
+    ts = int(datetime.datetime.now().timestamp()) if timestamp is None else timestamp
+    patient_id = metadata.patient_id or "ANONYMOUS"
+    study_instance_uid = metadata.study_instance_uid or f"study_{ts}"
+    series_instance_uid = metadata.series_instance_uid or f"series_{ts}"
+    modality = metadata.modality or "CT"
+    body_part = metadata.body_part or "UNKNOWN"
+    spatial_orientation = metadata.spatial_orientation or "RAS"
+
+    return PatientStudy(
+        patient_id=patient_id,
+        study_instance_uid=study_instance_uid,
+        series_instance_uid=series_instance_uid,
+        modality=modality,
+        body_part=body_part,
+        spatial_orientation=spatial_orientation,
+        voxel_spacing_x=float(spacing[0]),
+        voxel_spacing_y=float(spacing[1]),
+        voxel_spacing_z=float(spacing[2]),
+        dimensions_x=int(dims[0]),
+        dimensions_y=int(dims[1]),
+        dimensions_z=int(dims[2]),
+    )
+
+
+def build_segmentation_run(
+    study_id: int,
+    metrics: SegmentationMetrics,
+    model_name: str,
+    roi_size: str,
+    overlap: float,
+    device: str,
+    output_mask_blob_uri: Optional[str] = None,
+) -> SegmentationRun:
+    """
+    Construct a SegmentationRun ORM model associated with a parent study.
+
+    Args:
+        study_id: Foreign key ID of parent PatientStudy.
+        metrics: Segmentation metrics containing duration.
+        model_name: Identifier name of segmentation model.
+        roi_size: Sliding-window patch size string.
+        overlap: Sliding-window overlap fraction.
+        device: Execution compute device string.
+        output_mask_blob_uri: Optional cloud URI of saved mask.
+
+    Returns:
+        Instantiated SegmentationRun model.
+    """
+    if not isinstance(study_id, int) or study_id <= 0:
+        raise ValueError(f"study_id must be a strictly positive integer, got {study_id}.")
+    if metrics is None:
+        raise TypeError("metrics must be a SegmentationMetrics instance, got None.")
+
+    return SegmentationRun(
+        study_id=study_id,
+        model_name=model_name,
+        roi_size=roi_size,
+        overlap=overlap,
+        device=device,
+        duration_seconds=metrics.duration_seconds,
+        output_mask_blob_uri=output_mask_blob_uri,
+    )
+
+
+def build_volume_metric(
+    run_id: int,
+    label: LabelSummaryMetric,
+) -> VolumeMetric:
+    """
+    Construct a VolumeMetric ORM model from a LabelSummaryMetric.
+    Safely handles missing or truncated physical centroid and bounding box coordinates.
+
+    Args:
+        run_id: Foreign key ID of parent SegmentationRun.
+        label: Volumetric summary statistics for a segmented structure.
+
+    Returns:
+        Instantiated VolumeMetric model.
+    """
+    if not isinstance(run_id, int) or run_id <= 0:
+        raise ValueError(f"run_id must be a strictly positive integer, got {run_id}.")
+    if label is None or not isinstance(label, LabelSummaryMetric):
+        raise TypeError(f"label must be a LabelSummaryMetric instance, got {type(label).__name__}.")
+
+    raw_c = tuple(label.centroid_mm) if getattr(label, "centroid_mm", None) else ()
+    c = (raw_c + (0.0, 0.0, 0.0))[:3]
+
+    raw_b = tuple(label.bounding_box) if getattr(label, "bounding_box", None) else ()
+    b = (raw_b + (0, 0, 0, 0, 0, 0))[:6]
+
+    return VolumeMetric(
+        run_id=run_id,
+        label_id=label.label_id,
+        structure_name=label.structure_name,
+        voxel_count=label.voxel_count,
+        volume_mm3=label.volume_mm3,
+        volume_cm3=label.volume_cm3,
+        mean_intensity=label.mean_intensity,
+        std_intensity=label.std_intensity,
+        min_intensity=label.min_intensity,
+        max_intensity=label.max_intensity,
+        centroid_x_mm=float(c[0]),
+        centroid_y_mm=float(c[1]),
+        centroid_z_mm=float(c[2]),
+        bbox_min_x=int(b[0]),
+        bbox_min_y=int(b[1]),
+        bbox_min_z=int(b[2]),
+        bbox_max_x=int(b[3]),
+        bbox_max_y=int(b[4]),
+        bbox_max_z=int(b[5]),
+    )
+
+
+def build_volume_metrics(
+    run_id: int,
+    labels: Iterable[LabelSummaryMetric],
+) -> List[VolumeMetric]:
+    """
+    Construct a list of VolumeMetric ORM models from an iterable of LabelSummaryMetric.
+
+    Args:
+        run_id: Foreign key ID of parent SegmentationRun.
+        labels: Iterable of LabelSummaryMetric objects.
+
+    Returns:
+        List of instantiated VolumeMetric models.
+    """
+    if not isinstance(run_id, int) or run_id <= 0:
+        raise ValueError(f"run_id must be a strictly positive integer, got {run_id}.")
+    if labels is None:
+        return []
+    return [build_volume_metric(run_id=run_id, label=label) for label in labels]
 
 
 def chunked_iterable(iterable: Iterable[Any], chunk_size: int = 500) -> Generator[List[Any], None, None]:
@@ -166,75 +328,35 @@ class DatabaseManager:
         Returns:
             Tuple of (study_id, run_id).
         """
-        raw_sp = tuple(metadata.spacing) if metadata.spacing else ()
-        spacing = (raw_sp + (1.0, 1.0, 1.0))[:3]
-
-        raw_dims = tuple(metadata.dimensions) if metadata.dimensions else ()
-        dims = (raw_dims + (0, 0, 0))[:3]
-
         with self.get_session() as session:
-            study = PatientStudy(
-                patient_id=metadata.patient_id or "ANONYMOUS",
-                study_instance_uid=metadata.study_instance_uid or f"study_{int(datetime.datetime.now().timestamp())}",
-                series_instance_uid=metadata.series_instance_uid or f"series_{int(datetime.datetime.now().timestamp())}",
-                modality=metadata.modality or "CT",
-                body_part=metadata.body_part or "UNKNOWN",
-                spatial_orientation=metadata.spatial_orientation or "RAS",
-                voxel_spacing_x=float(spacing[0]),
-                voxel_spacing_y=float(spacing[1]),
-                voxel_spacing_z=float(spacing[2]),
-                dimensions_x=int(dims[0]),
-                dimensions_y=int(dims[1]),
-                dimensions_z=int(dims[2]),
-            )
+            study = build_patient_study(metadata)
             session.add(study)
             session.flush()
 
-            run = SegmentationRun(
+            run = build_segmentation_run(
                 study_id=study.id,
+                metrics=metrics,
                 model_name=model_name,
                 roi_size=roi_size,
                 overlap=overlap,
                 device=device,
-                duration_seconds=metrics.duration_seconds,
                 output_mask_blob_uri=output_mask_blob_uri,
             )
             session.add(run)
             session.flush()
 
-            for label in metrics.labels:
-                raw_c = tuple(label.centroid_mm) if label.centroid_mm else ()
-                c = (raw_c + (0.0, 0.0, 0.0))[:3]
-
-                raw_b = tuple(label.bounding_box) if label.bounding_box else ()
-                b = (raw_b + (0, 0, 0, 0, 0, 0))[:6]
-                vol_metric = VolumeMetric(
-                    run_id=run.id,
-                    label_id=label.label_id,
-                    structure_name=label.structure_name,
-                    voxel_count=label.voxel_count,
-                    volume_mm3=label.volume_mm3,
-                    volume_cm3=label.volume_cm3,
-                    mean_intensity=label.mean_intensity,
-                    std_intensity=label.std_intensity,
-                    min_intensity=label.min_intensity,
-                    max_intensity=label.max_intensity,
-                    centroid_x_mm=float(c[0]),
-                    centroid_y_mm=float(c[1]),
-                    centroid_z_mm=float(c[2]),
-                    bbox_min_x=int(b[0]),
-                    bbox_min_y=int(b[1]),
-                    bbox_min_z=int(b[2]),
-                    bbox_max_x=int(b[3]),
-                    bbox_max_y=int(b[4]),
-                    bbox_max_z=int(b[5]),
-                )
+            for vol_metric in build_volume_metrics(run.id, metrics.labels):
                 session.add(vol_metric)
 
             study_id, run_id = study.id, run.id
 
         logger.info("Successfully persisted study_id=%d and run_id=%d.", study_id, run_id)
         return study_id, run_id
+
+    build_patient_study = staticmethod(build_patient_study)
+    build_segmentation_run = staticmethod(build_segmentation_run)
+    build_volume_metric = staticmethod(build_volume_metric)
+    build_volume_metrics = staticmethod(build_volume_metrics)
 
     def bulk_insert_slice_metrics(
         self,

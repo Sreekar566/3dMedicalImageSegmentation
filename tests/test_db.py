@@ -24,6 +24,10 @@ from medical_segmentation.db import (
     SegmentationRun,
     VolumeMetric,
     VoxelSliceMetric,
+    build_patient_study,
+    build_segmentation_run,
+    build_volume_metric,
+    build_volume_metrics,
     chunked_iterable,
 )
 from medical_segmentation.io.dicom_loader import VolumetricMetadata
@@ -719,3 +723,147 @@ def test_database_manager_bulk_insert_slice_metrics_invalid_run_id(
 
     with pytest.raises(ValueError, match="run_id must be a strictly positive integer"):
         db_manager.bulk_insert_slice_metrics(run_id=-1, slice_generator=iter([]))
+
+
+def test_build_patient_study_standalone(sample_metadata: VolumetricMetadata) -> None:
+    """Verify build_patient_study correctly transforms VolumetricMetadata into PatientStudy."""
+    study = build_patient_study(sample_metadata)
+    assert isinstance(study, PatientStudy)
+    assert study.patient_id == "PAT_TEST_888"
+    assert study.study_instance_uid == "1.2.840.113619.2.55.12345"
+    assert study.series_instance_uid == "1.2.840.113619.2.55.67890"
+    assert study.modality == "CT"
+    assert study.body_part == "ABDOMEN"
+    assert study.spatial_orientation == "RAS"
+    assert (study.voxel_spacing_x, study.voxel_spacing_y, study.voxel_spacing_z) == (0.75, 0.75, 2.0)
+    assert (study.dimensions_x, study.dimensions_y, study.dimensions_z) == (512, 512, 120)
+
+    # Test fallback defaults and deterministic timestamp
+    empty_meta = VolumetricMetadata(patient_id="", study_instance_uid="", series_instance_uid="")
+    fallback_study = build_patient_study(empty_meta, timestamp=1700000000)
+    assert fallback_study.patient_id == "ANONYMOUS"
+    assert fallback_study.study_instance_uid == "study_1700000000"
+    assert fallback_study.series_instance_uid == "series_1700000000"
+    assert fallback_study.modality == "CT"
+    assert fallback_study.body_part == "UNKNOWN"
+    assert fallback_study.spatial_orientation == "RAS"
+    assert (fallback_study.voxel_spacing_x, fallback_study.voxel_spacing_y, fallback_study.voxel_spacing_z) == (1.0, 1.0, 1.0)
+    assert (fallback_study.dimensions_x, fallback_study.dimensions_y, fallback_study.dimensions_z) == (0, 0, 0)
+
+    # Test staticmethod alias on DatabaseManager
+    alias_study = DatabaseManager.build_patient_study(sample_metadata)
+    assert alias_study.study_instance_uid == sample_metadata.study_instance_uid
+
+    # Type validation
+    with pytest.raises(TypeError, match="metadata must be a VolumetricMetadata instance"):
+        build_patient_study(None)  # type: ignore[arg-type]
+
+
+def test_build_segmentation_run_standalone(sample_metrics: SegmentationMetrics) -> None:
+    """Verify build_segmentation_run instantiates SegmentationRun with expected fields and validation."""
+    run = build_segmentation_run(
+        study_id=42,
+        metrics=sample_metrics,
+        model_name="MONAI_3D_UNet",
+        roi_size="(96, 96, 96)",
+        overlap=0.5,
+        device="cuda:0",
+        output_mask_blob_uri="https://azure.blob.core.windows.net/masks/run42.nii.gz",
+    )
+    assert isinstance(run, SegmentationRun)
+    assert run.study_id == 42
+    assert run.model_name == "MONAI_3D_UNet"
+    assert run.roi_size == "(96, 96, 96)"
+    assert run.overlap == 0.5
+    assert run.device == "cuda:0"
+    assert run.duration_seconds == 8.75
+    assert run.output_mask_blob_uri == "https://azure.blob.core.windows.net/masks/run42.nii.gz"
+
+    # Staticmethod alias
+    alias_run = DatabaseManager.build_segmentation_run(
+        study_id=1,
+        metrics=sample_metrics,
+        model_name="MONAI",
+        roi_size="(64, 64, 64)",
+        overlap=0.25,
+        device="cpu",
+    )
+    assert alias_run.study_id == 1
+
+    # Validation errors
+    with pytest.raises(ValueError, match="study_id must be a strictly positive integer"):
+        build_segmentation_run(study_id=0, metrics=sample_metrics, model_name="M", roi_size="R", overlap=0.5, device="cpu")
+
+    with pytest.raises(ValueError, match="study_id must be a strictly positive integer"):
+        build_segmentation_run(study_id=-5, metrics=sample_metrics, model_name="M", roi_size="R", overlap=0.5, device="cpu")
+
+    with pytest.raises(TypeError, match="metrics must be a SegmentationMetrics instance"):
+        build_segmentation_run(study_id=1, metrics=None, model_name="M", roi_size="R", overlap=0.5, device="cpu")  # type: ignore[arg-type]
+
+
+def test_build_volume_metric_and_metrics_standalone(sample_metrics: SegmentationMetrics) -> None:
+    """Verify build_volume_metric and build_volume_metrics correctly create VolumeMetric records."""
+    label = sample_metrics.labels[0]
+    vm = build_volume_metric(run_id=10, label=label)
+    assert isinstance(vm, VolumeMetric)
+    assert vm.run_id == 10
+    assert vm.label_id == 1
+    assert vm.structure_name == "Liver"
+    assert vm.voxel_count == 25000
+    assert vm.volume_mm3 == 28125.0
+    assert vm.volume_cm3 == 28.125
+    assert vm.mean_intensity == 105.4
+    assert vm.std_intensity == 14.2
+    assert vm.min_intensity == 60.0
+    assert vm.max_intensity == 150.0
+    assert (vm.centroid_x_mm, vm.centroid_y_mm, vm.centroid_z_mm) == (125.0, 160.0, -40.0)
+    assert (vm.bbox_min_x, vm.bbox_min_y, vm.bbox_min_z, vm.bbox_max_x, vm.bbox_max_y, vm.bbox_max_z) == (40, 50, 10, 240, 260, 90)
+
+    # Batch builder
+    vms = build_volume_metrics(run_id=10, labels=sample_metrics.labels)
+    assert len(vms) == 2
+    assert vms[0].label_id == 1
+    assert vms[1].label_id == 2
+
+    # Empty iterable
+    assert build_volume_metrics(run_id=10, labels=[]) == []
+    assert build_volume_metrics(run_id=10, labels=None) == []  # type: ignore[arg-type]
+
+    # Staticmethod alias
+    alias_vm = DatabaseManager.build_volume_metric(run_id=5, label=label)
+    assert alias_vm.run_id == 5
+
+    # Safe fallback for truncated centroid and bbox
+    malformed_label = LabelSummaryMetric(
+        label_id=9,
+        structure_name="Malformed",
+        voxel_count=50,
+        volume_mm3=100.0,
+        volume_cm3=0.1,
+        mean_intensity=10.0,
+        std_intensity=1.0,
+        min_intensity=5.0,
+        max_intensity=15.0,
+        centroid_mm=(5.0,),  # Len < 3
+        bounding_box=(1, 2),  # Len < 6
+    )
+    vm_malformed = build_volume_metric(run_id=10, label=malformed_label)
+    assert (vm_malformed.centroid_x_mm, vm_malformed.centroid_y_mm, vm_malformed.centroid_z_mm) == (5.0, 0.0, 0.0)
+    assert (
+        vm_malformed.bbox_min_x,
+        vm_malformed.bbox_min_y,
+        vm_malformed.bbox_min_z,
+        vm_malformed.bbox_max_x,
+        vm_malformed.bbox_max_y,
+        vm_malformed.bbox_max_z,
+    ) == (1, 2, 0, 0, 0, 0)
+
+    # Validation errors
+    with pytest.raises(ValueError, match="run_id must be a strictly positive integer"):
+        build_volume_metric(run_id=0, label=label)
+
+    with pytest.raises(ValueError, match="run_id must be a strictly positive integer"):
+        build_volume_metrics(run_id=-1, labels=[label])
+
+    with pytest.raises(TypeError, match="label must be a LabelSummaryMetric instance"):
+        build_volume_metric(run_id=1, label=None)  # type: ignore[arg-type]
