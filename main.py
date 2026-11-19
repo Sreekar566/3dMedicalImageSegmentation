@@ -31,6 +31,7 @@ from medical_segmentation.diagnostics import (
     check_system_health as _diagnostics_check_system_health,
     run_health_check as _diagnostics_run_health_check,
 )
+from medical_segmentation.io.volume_ingester import validate_input_sources
 from medical_segmentation.logging_config import (
     StandardTextFormatter,
     StructuredJsonFormatter,
@@ -190,19 +191,11 @@ def run_pipeline(
         if output_container is not None:
             validate_azure_container_name(output_container)
 
-        clean_blob = blob_path.strip() if isinstance(blob_path, str) and blob_path.strip() else None
-        clean_prefix = series_prefix.strip() if isinstance(series_prefix, str) and series_prefix.strip() else None
-        clean_local = Path(local_input).resolve() if local_input is not None and str(local_input).strip() else None
-
-        inputs_provided = sum(1 for x in (clean_blob, clean_prefix, clean_local) if x is not None)
-        if inputs_provided == 0:
-            raise ValueError(
-                "No input volume source specified (provide exactly one of local_input, series_prefix, or blob_path)."
-            )
-        if inputs_provided > 1:
-            raise ValueError(
-                "Conflicting input volume sources specified; provide exactly one of local_input, series_prefix, or blob_path."
-            )
+        clean_blob, clean_prefix, clean_local = validate_input_sources(
+            blob_path=blob_path,
+            series_prefix=series_prefix,
+            local_input=local_input,
+        )
 
         active_config = config or default_config
         with PipelineOrchestrator(config=active_config) as orchestrator:

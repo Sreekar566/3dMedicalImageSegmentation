@@ -26,6 +26,7 @@ from medical_segmentation.config import (
 from medical_segmentation.db.database import DatabaseManager, chunked_iterable
 from medical_segmentation.io.dicom_loader import DicomVolumeLoader, VolumetricMetadata
 from medical_segmentation.io.mask_writer import VolumetricMaskWriter
+from medical_segmentation.io.volume_ingester import VolumeIngester
 from medical_segmentation.main import main, parse_args, run_pipeline
 from medical_segmentation.pipeline import (
     PipelineOrchestrator,
@@ -1614,3 +1615,26 @@ def test_config_enhanced_spacing_and_device() -> None:
         validate_azure_container_name("")
     with pytest.raises(ValueError, match="Container name cannot be empty"):
         validate_azure_container_name("   ")
+
+
+def test_pipeline_orchestrator_volume_ingester_injection(tmp_path: Path) -> None:
+    """Verify that a custom VolumeIngester can be injected into PipelineOrchestrator."""
+    mock_ingester = MagicMock(spec=VolumeIngester)
+    expected_path = tmp_path / "custom_injected.nii.gz"
+    mock_ingester.ingest.return_value = (expected_path, False)
+
+    orchestrator = PipelineOrchestrator(
+        workspace=tmp_path,
+        volume_ingester=mock_ingester,
+    )
+
+    result_path, is_dir = orchestrator.ingest_volume(blob_path="test_blob.nii.gz")
+    assert result_path == expected_path
+    assert is_dir is False
+    mock_ingester.ingest.assert_called_once_with(
+        blob_path="test_blob.nii.gz",
+        series_prefix=None,
+        local_input=None,
+        input_container=None,
+    )
+

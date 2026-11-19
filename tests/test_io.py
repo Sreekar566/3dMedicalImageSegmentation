@@ -30,6 +30,7 @@ from medical_segmentation.io.dicom_loader import (
     sitk_to_numpy,
 )
 from medical_segmentation.io.mask_writer import VolumetricMaskWriter, save_mask_as_nifti
+from medical_segmentation.io.volume_ingester import VolumeIngester, validate_input_sources
 from medical_segmentation.pipeline.orchestrator import PipelineOrchestrator, PipelineResult
 
 
@@ -1046,6 +1047,129 @@ def test_azure_client_enhanced_input_validation(tmp_path: Path) -> None:
         client.list_blobs("INVALID_UPPER")
     with pytest.raises(TypeError, match="prefix must be a string"):
         client.list_blobs("valid-container", prefix=123)  # type: ignore[arg-type]
+
+
+def test_validate_input_sources(tmp_path: Path) -> None:
+    """Verify validate_input_sources correctly parses single sources and rejects missing/conflicting sources."""
+    local_file = tmp_path / "volume.nii.gz"
+    local_file.write_text("dummy")
+
+    # Valid cases
+    b, p, l = validate_input_sources(local_input=local_file)
+    assert b is None and p is None and l == local_file.resolve()
+
+    b, p, l = validate_input_sources(blob_path="volumes/study1.nii.gz")
+    assert b == "volumes/study1.nii.gz" and p is None and l is None
+
+    b, p, l = validate_input_sources(series_prefix="series/series_001/")
+    assert b is None and p == "series/series_001/" and l is None
+
+    # Missing sources
+    with pytest.raises(ValueError, match="No input volume source specified"):
+        validate_input_sources()
+
+    with pytest.raises(ValueError, match="No input volume source specified"):
+        validate_input_sources(blob_path="", series_prefix="  ", local_input=None)
+
+    # Conflicting sources
+    with pytest.raises(ValueError, match="Conflicting input volume sources"):
+        validate_input_sources(blob_path="a.nii.gz", series_prefix="b/")
+
+    with pytest.raises(ValueError, match="Conflicting input volume sources"):
+        validate_input_sources(blob_path="a.nii.gz", local_input=local_file)
+
+    with pytest.raises(ValueError, match="Conflicting input volume sources"):
+        validate_input_sources(series_prefix="b/", local_input=local_file)
+
+    with pytest.raises(ValueError, match="Conflicting input volume sources"):
+        validate_input_sources(blob_path="a.nii.gz", series_prefix="b/", local_input=local_file)
+
+
+def test_volume_ingester_local_resolution(tmp_path: Path) -> None:
+    """Verify VolumeIngester resolves local files and directories accurately."""
+    ingester = VolumeIngester(workspace=tmp_path / "workspace")
+
+    # 1. Local file
+    local_file = tmp_path / "study.nii.gz"
+    local_file.write_text("data")
+    path, is_dir = ingester.ingest(local_input=local_file)
+    assert path == local_file.resolve()
+    assert is_dir is False
+
+    # 2. Local directory
+    local_dir = tmp_path / "dicom_series"
+    local_dir.mkdir()
+    path_dir, is_dir_true = ingester.ingest(local_input=local_dir)
+    assert path_dir == local_dir.resolve()
+    assert is_dir_true is True
+
+    # 3. Missing local path raises FileNotFoundError
+    with pytest.raises(FileNotFoundError, match="Local input path not found"):
+        ingester.ingest(local_input=tmp_path / "nonexistent.nii.gz")
+
+
+def test_volume_ingester_azure_downloads(tmp_path: Path) -> None:
+    """Verify VolumeIngester coordinates Azure blob and DICOM series prefix downloads."""
+    mock_azure = MagicMock(spec=AzureBlobClient)
+    workspace = tmp_path / "workspace"
+    ingester = VolumeIngester(azure_client=mock_azure, workspace=workspace)
+
+    assert ingester.raw_volumes_dir == workspace / "raw_volumes"
+    assert ingester.raw_series_dir == workspace / "raw_series"
+
+    # 1. Azure blob download
+    dest_file = workspace / "raw_volumes" / "patient.nii.gz"
+    mock_azure.download_blob_to_file.return_value = dest_file
+    res_path, res_is_dir = ingester.ingest(
+        blob_path="inputs/patient.nii.gz",
+        input_container="custom-container",
+    )
+    assert res_path == dest_file
+    assert res_is_dir is False
+    mock_azure.download_blob_to_file.assert_called_once_with(
+        container_name="custom-container",
+        blob_name="inputs/patient.nii.gz",
+        destination_path=dest_file,
+    )
+
+    # 2. Azure series prefix download
+    mock_azure.reset_mock()
+    dest_series = workspace / "raw_series" / "series_01"
+    mock_azure.download_series_prefix.return_value = [dest_series / "slice1.dcm"]
+    res_series_path, res_series_is_dir = ingester.ingest(
+        series_prefix="dicom/series_01",
+        input_container="custom-container",
+    )
+    assert res_series_path == dest_series
+    assert res_series_is_dir is True
+    mock_azure.download_series_prefix.assert_called_once_with(
+        container_name="custom-container",
+        prefix="dicom/series_01",
+        destination_dir=dest_series,
+    )
+
+
+def test_volume_ingester_validation_errors(tmp_path: Path) -> None:
+    """Verify VolumeIngester error handling for missing client, invalid containers, and empty workspace."""
+    # 1. Empty workspace path validation
+    with pytest.raises(ValueError, match="workspace cannot be an empty path"):
+        VolumeIngester(workspace="")
+    with pytest.raises(ValueError, match="workspace cannot be an empty path"):
+        VolumeIngester(workspace="   ")
+
+    # 2. Cloud ingestion requires azure_client
+    offline_ingester = VolumeIngester(azure_client=None, workspace=tmp_path)
+    with pytest.raises(RuntimeError, match="AzureBlobClient is required"):
+        offline_ingester.ingest(blob_path="vol.nii.gz")
+    with pytest.raises(RuntimeError, match="AzureBlobClient is required"):
+        offline_ingester.ingest(series_prefix="series/")
+
+    # 3. Invalid container name validation
+    mock_azure = MagicMock(spec=AzureBlobClient)
+    ingester = VolumeIngester(azure_client=mock_azure, workspace=tmp_path)
+    with pytest.raises(ValueError, match="Invalid Azure Blob container name"):
+        ingester.ingest(blob_path="vol.nii.gz", input_container="INVALID_CONTAINER")
+
 
 
 

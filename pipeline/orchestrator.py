@@ -27,6 +27,7 @@ from medical_segmentation.config import (
 from medical_segmentation.io.azure_client import AzureBlobClient
 from medical_segmentation.io.dicom_loader import DicomVolumeLoader, VolumetricMetadata, sitk_to_numpy
 from medical_segmentation.io.mask_writer import VolumetricMaskWriter, save_mask_as_nifti
+from medical_segmentation.io.volume_ingester import VolumeIngester, validate_input_sources
 from medical_segmentation.pipeline.inference import SlidingWindowInferenceEngine
 from medical_segmentation.pipeline.metrics import (
     SegmentationMetrics,
@@ -103,6 +104,7 @@ class PipelineOrchestrator:
         metrics_calculator: Optional[VolumetricMetricsCalculator] = None,
         workspace: Optional[Path | str] = None,
         mask_writer: Optional[VolumetricMaskWriter] = None,
+        volume_ingester: Optional[VolumeIngester] = None,
     ):
         self.config = config or default_config
         self.azure_client = azure_client or AzureBlobClient(self.config.azure)
@@ -121,6 +123,11 @@ class PipelineOrchestrator:
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.mask_writer = mask_writer or VolumetricMaskWriter(
             default_output_dir=self.workspace / "outputs"
+        )
+        self.volume_ingester = volume_ingester or VolumeIngester(
+            azure_client=self.azure_client,
+            workspace=self.workspace,
+            default_container=self.config.azure.input_container,
         )
 
     def close(self) -> None:
@@ -157,59 +164,12 @@ class PipelineOrchestrator:
         Returns:
             Tuple of (resolved_path, is_dicom_dir).
         """
-        clean_blob = blob_path.strip() if isinstance(blob_path, str) and blob_path.strip() else None
-        clean_prefix = series_prefix.strip() if isinstance(series_prefix, str) and series_prefix.strip() else None
-        clean_local = Path(local_input).resolve() if local_input is not None and str(local_input).strip() else None
-
-        inputs_provided = sum(1 for x in (clean_blob, clean_prefix, clean_local) if x is not None)
-        if inputs_provided == 0:
-            raise ValueError(
-                "No input volume source specified (provide exactly one of local_input, series_prefix, or blob_path)."
-            )
-        if inputs_provided > 1:
-            raise ValueError(
-                "Conflicting input volume sources specified; provide exactly one of local_input, series_prefix, or blob_path."
-            )
-
-        container = (
-            validate_azure_container_name(input_container)
-            if input_container is not None
-            else self.config.azure.input_container
+        return self.volume_ingester.ingest(
+            blob_path=blob_path,
+            series_prefix=series_prefix,
+            local_input=local_input,
+            input_container=input_container,
         )
-
-        if clean_local is not None:
-            if not clean_local.exists():
-                raise FileNotFoundError(f"Local input path not found: {clean_local}")
-            logger.info("Operating in local mode using path: '%s'", clean_local)
-            return clean_local, clean_local.is_dir()
-
-        if clean_prefix is not None:
-            logger.info(
-                "Downloading DICOM series prefix '%s' from container '%s'...",
-                clean_prefix,
-                container,
-            )
-            series_dir = self.workspace / "raw_series" / Path(clean_prefix).name
-            self.azure_client.download_series_prefix(
-                container_name=container,
-                prefix=clean_prefix,
-                destination_dir=series_dir,
-            )
-            return series_dir, True
-
-        assert clean_blob is not None
-        logger.info(
-            "Downloading volume blob '%s' from container '%s'...",
-            clean_blob,
-            container,
-        )
-        local_file = self.workspace / "raw_volumes" / Path(clean_blob).name
-        self.azure_client.download_blob_to_file(
-            container_name=container,
-            blob_name=clean_blob,
-            destination_path=local_file,
-        )
-        return local_file, False
 
     def standardize_geometry(
         self,

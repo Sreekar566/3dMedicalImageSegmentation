@@ -13,10 +13,12 @@ from .dicom_loader import (
     sitk_to_numpy,
 )
 from .mask_writer import VolumetricMaskWriter, save_mask_as_nifti
+from .volume_ingester import VolumeIngester, validate_input_sources
 
 __all__ = [
     "AzureBlobClient",
     "DicomVolumeLoader",
+    "VolumeIngester",
     "VolumetricMaskWriter",
     "VolumetricMetadata",
     "extract_pydicom_metadata",
@@ -24,4 +26,5 @@ __all__ = [
     "safe_parse_str",
     "save_mask_as_nifti",
     "sitk_to_numpy",
+    "validate_input_sources",
 ]
