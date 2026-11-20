@@ -36,6 +36,7 @@ from medical_segmentation.pipeline import (
     PipelineResult,
     SegmentationMetrics,
 )
+from medical_segmentation.pipeline.metrics import LabelSummaryMetric
 from medical_segmentation.pipeline.inference import (
     SlidingWindowInferenceEngine,
     VolumetricMetricsCalculator,
@@ -1841,4 +1842,263 @@ def test_cli_config_argument_and_main_dispatch(monkeypatch: pytest.MonkeyPatch, 
         _, health_kwargs = mock_health.call_args
         assert health_kwargs.get("config") is not None
         assert health_kwargs["config"].inference.modality == "MRI"
+
+
+def test_volumetric_metrics_calculator_compute_label_summary_direct() -> None:
+    """Verify compute_label_summary directly computes volume, intensity, and geometric statistics."""
+    calc = VolumetricMetricsCalculator()
+    meta = VolumetricMetadata(
+        spacing=(1.0, 1.0, 2.0),
+        origin=(0.0, 0.0, 0.0),
+        spatial_orientation="RAS",
+    )
+    raw_array = np.full((10, 10, 10), 100.0, dtype=np.float32)
+
+    # 1. Zero voxel mask returns None
+    empty_mask = np.zeros((10, 10, 10), dtype=bool)
+    assert calc.compute_label_summary(raw_array, empty_mask, 1, meta) is None
+
+    # 2. Non-empty mask returns valid LabelSummaryMetric
+    active_mask = np.zeros((10, 10, 10), dtype=bool)
+    active_mask[2:6, 2:6, 2:6] = True  # 4 * 4 * 4 = 64 voxels
+    summary = calc.compute_label_summary(raw_array, active_mask, 1, meta)
+    assert summary is not None
+    assert isinstance(summary, LabelSummaryMetric)
+    assert summary.label_id == 1
+    assert summary.voxel_count == 64
+    assert summary.volume_mm3 == pytest.approx(64 * (1.0 * 1.0 * 2.0))
+    assert summary.volume_cm3 == pytest.approx((64 * 2.0) / 1000.0)
+    assert summary.mean_intensity == pytest.approx(100.0)
+    assert summary.min_intensity == pytest.approx(100.0)
+    assert summary.max_intensity == pytest.approx(100.0)
+
+
+def test_volumetric_metrics_calculator_generate_slice_metrics_defaults_and_fallback_metadata() -> None:
+    """Verify generate_slice_metrics handles default None bounds/counts and metadata without plane resolver."""
+    calc = VolumetricMetricsCalculator()
+    raw = np.full((6, 6, 6), 50.0, dtype=np.float32)
+    mask = np.zeros((6, 6, 6), dtype=np.int32)
+    mask[2, 1:4, 1:4] = 1  # Slice 2
+    mask[4, 1:4, 1:4] = 1  # Slice 4
+
+    # 1. Default None bounds and slice counts (traverses entire depth and computes counts per slice)
+    meta = VolumetricMetadata(
+        spacing=(1.5, 1.5, 2.0),
+        origin=(0.0, 0.0, 0.0),
+        spatial_orientation="RAS",
+    )
+    records = list(
+        calc.generate_slice_metrics(
+            raw_array=raw,
+            mask_array=mask,
+            unique_labels=[1],
+            metadata=meta,
+            label_bounds=None,
+            label_slice_counts=None,
+        )
+    )
+    assert len(records) == 2
+    assert records[0]["slice_index"] == 2
+    assert records[1]["slice_index"] == 4
+    assert records[0]["slice_voxel_count"] == 9
+    assert records[0]["cross_sectional_area_mm2"] == pytest.approx(9 * (1.5 * 1.5))
+    assert records[0]["plane"] == "axial"
+
+    # 2. Metadata lacking get_slice_plane_and_position method falls back to axial and coordinate transform
+    class MinimalMetadata:
+        pixel_area_axial_mm2 = 2.25
+
+        def continuous_index_to_physical_point(self, idx: Tuple[float, float, float]) -> Tuple[float, float, float]:
+            return (0.0, 0.0, float(idx[2]) * 2.0)
+
+    min_meta = MinimalMetadata()
+    fallback_records = list(
+        calc.generate_slice_metrics(
+            raw_array=raw,
+            mask_array=mask,
+            unique_labels=[1],
+            metadata=min_meta,  # type: ignore[arg-type]
+        )
+    )
+    assert len(fallback_records) == 2
+    assert fallback_records[0]["plane"] == "axial"
+    assert fallback_records[0]["slice_position_mm"] == pytest.approx(4.0)  # index 2 * 2.0
+
+    # 3. Known slice counts with zero-count slices skipped
+    known_counts_records = list(
+        calc.generate_slice_metrics(
+            raw_array=raw,
+            mask_array=mask,
+            unique_labels=[1],
+            metadata=meta,
+            label_bounds={1: (0, 5)},
+            label_slice_counts={1: np.array([0, 0, 9, 0, 9, 0])},
+        )
+    )
+    assert len(known_counts_records) == 2
+    assert known_counts_records[0]["slice_index"] == 2
+    assert known_counts_records[1]["slice_index"] == 4
+
+
+def test_pipeline_orchestrator_dynamic_orientation_change() -> None:
+    """Verify standardize_geometry re-instantiates volume_loader when a different orientation is requested."""
+    config = PipelineConfig(inference=InferenceSettings(target_orientation="RAS"))
+    orchestrator = PipelineOrchestrator(config=config)
+    assert orchestrator.volume_loader.target_orientation == "RAS"
+
+    sitk_img = sitk.GetImageFromArray(np.zeros((4, 4, 4), dtype=np.float32))
+    meta = VolumetricMetadata(spatial_orientation="LPS")
+    with patch.object(DicomVolumeLoader, "load", return_value=(sitk_img, meta)):
+        _, returned_meta = orchestrator.standardize_geometry(Path("/mock/scan.nii"), is_dicom_dir=False, orientation="LPS")
+        assert orchestrator.volume_loader.target_orientation == "LPS"
+        assert returned_meta.spatial_orientation == "LPS"
+
+
+def test_pipeline_orchestrator_custom_loader_dispatch_fallbacks() -> None:
+    """Verify standardize_geometry falls back to load_dicom_series or load_volume_file if loader lacks load()."""
+    sitk_img = sitk.GetImageFromArray(np.zeros((4, 4, 4), dtype=np.float32))
+    meta = VolumetricMetadata()
+
+    custom_loader = MagicMock(spec=["load_dicom_series", "load_volume_file", "target_orientation"])
+    custom_loader.target_orientation = "RAS"
+    custom_loader.load_dicom_series.return_value = (sitk_img, meta)
+    custom_loader.load_volume_file.return_value = (sitk_img, meta)
+
+    orchestrator = PipelineOrchestrator(volume_loader=custom_loader)
+
+    # 1. is_dicom_dir=True -> load_dicom_series
+    orchestrator.standardize_geometry(Path("/mock/dicom_dir"), is_dicom_dir=True)
+    custom_loader.load_dicom_series.assert_called_once_with(Path("/mock/dicom_dir"))
+
+    # 2. is_dicom_dir=False -> load_volume_file
+    orchestrator.standardize_geometry(Path("/mock/file.nii"), is_dicom_dir=False)
+    custom_loader.load_volume_file.assert_called_once_with(Path("/mock/file.nii"))
+
+
+def test_pipeline_orchestrator_db_persistence_resilience_and_batch_size_validation() -> None:
+    """Verify persist_to_database validates batch_size and gracefully logs and survives db exceptions."""
+    orchestrator = PipelineOrchestrator()
+    meta = VolumetricMetadata()
+    metrics = SegmentationMetrics(duration_seconds=1.0)
+
+    # 1. batch_size <= 0 raises ValueError
+    with pytest.raises(ValueError, match="batch_size must be a strictly positive integer"):
+        orchestrator.persist_to_database(meta, metrics, iter([]), batch_size=0)
+
+    # 2. Database exception handling: returns (None, None, 0) and does not raise
+    mock_db = MagicMock()
+    mock_db.init_tables.side_effect = RuntimeError("PostgreSQL connection refused")
+    orchestrator_with_mock = PipelineOrchestrator(db_manager=mock_db)
+
+    study_id, run_id, inserted = orchestrator_with_mock.persist_to_database(meta, metrics, iter([]))
+    assert study_id is None
+    assert run_id is None
+    assert inserted == 0
+
+
+def test_extract_state_dict_non_tensor_and_nested_prefix() -> None:
+    """Verify extract_state_dict ignores non-tensor entries and correctly strips nested prefixes."""
+    model = build_3d_unet(in_channels=1, out_channels=2)
+    target_keys = list(model.state_dict().keys())
+
+    # Build checkpoint with non-tensor entries and nested prefixes
+    first_key = target_keys[0]
+    raw_payload = {
+        "epoch": 42,
+        "loss": 0.05,
+        "metadata": {"version": "2.0"},
+        first_key: torch.zeros_like(model.state_dict()[first_key]),
+    }
+    cleaned = extract_state_dict(raw_payload, target_keys=target_keys)
+    assert first_key in cleaned
+    assert "epoch" not in cleaned
+    assert "loss" not in cleaned
+    assert "metadata" not in cleaned
+
+    # Test "model.model." prefix stripping: first_key is "model.0.conv...", so "model." + first_key starts with "model.model."
+    nested_payload = {
+        f"model.{first_key}": torch.zeros_like(model.state_dict()[first_key]),
+    }
+    cleaned_nested = extract_state_dict(nested_payload, target_keys=target_keys)
+    assert first_key in cleaned_nested
+
+
+def test_load_3d_unet_string_path_and_partial_checkpoint_warning(tmp_path: Path) -> None:
+    """Verify load_3d_unet supports string checkpoint paths and logs partial-match warning on non-strict load."""
+    model = build_3d_unet(in_channels=1, out_channels=2)
+    state = model.state_dict()
+    target_keys = list(state.keys())
+
+    # Create partial checkpoint with only 1 parameter
+    partial_state = {target_keys[0]: state[target_keys[0]]}
+    ckpt_file = tmp_path / "partial_unet.pt"
+    torch.save(partial_state, ckpt_file)
+
+    # Load using string path and strict=False
+    loaded_model = load_3d_unet(
+        checkpoint_path=str(ckpt_file),
+        in_channels=1,
+        out_channels=2,
+        strict=False,
+    )
+    assert isinstance(loaded_model, torch.nn.Module)
+
+
+def test_config_settings_string_parsers_and_edge_cases() -> None:
+    """Verify string parsers and validators for target_spacing, roi_size, and container names."""
+    # 1. parse_target_spacing edge cases
+    with pytest.raises(ValueError, match="Target spacing string must contain 3 comma-separated floats"):
+        parse_target_spacing("1.0, 2.0")
+    with pytest.raises(ValueError, match="Target spacing string must contain 3 comma-separated floats"):
+        parse_target_spacing("1.0, 2.0, abc")
+    with pytest.raises(ValueError, match="Target spacing values must be valid floats"):
+        parse_target_spacing(["1.0", "not_a_float", "2.0"])
+    with pytest.raises(ValueError, match="Target spacing dimensions must be strictly positive"):
+        parse_target_spacing([1.0, 2.0, -0.5])
+    with pytest.raises(ValueError, match="Target spacing dimensions must be strictly positive"):
+        parse_target_spacing([1.0, 2.0, float("nan")])
+    with pytest.raises(TypeError, match="Target spacing dimensions cannot be boolean values"):
+        parse_target_spacing([1.0, 2.0, True])
+    with pytest.raises(TypeError, match="Invalid type for target_spacing"):
+        parse_target_spacing(12345)
+
+    # 2. parse_roi_size edge cases
+    with pytest.raises(ValueError, match="ROI size string must contain 3 comma-separated integers"):
+        parse_roi_size("64, 64")
+    with pytest.raises(ValueError, match="ROI size string must contain 3 comma-separated integers"):
+        parse_roi_size("64, 64, invalid_int")
+    with pytest.raises(TypeError, match="Invalid type for roi_size"):
+        parse_roi_size(9999)
+
+    # 3. parse_model_checkpoint_path and InferenceSettings type edge cases
+    with pytest.raises(TypeError, match="Invalid type for model_checkpoint_path"):
+        parse_model_checkpoint_path(12345)
+    assert InferenceSettings.normalize_modality(12345) == 12345
+    with pytest.raises(TypeError, match="Execution device must be a string or torch.device"):
+        InferenceSettings.validate_device(12345)
+
+    # 4. validate_azure_container_name type error
+    with pytest.raises(TypeError, match="Container name must be a string"):
+        validate_azure_container_name(12345)  # type: ignore[arg-type]
+
+    # 5. AzureStorageSettings credentials stripping
+    assert AzureStorageSettings.strip_credentials(None) == ""
+    assert AzureStorageSettings.strip_credentials(123) == "123"
+
+    # 6. DatabaseSettings non-string field validator
+    with pytest.raises(TypeError, match="host must be a string"):
+        DatabaseSettings.validate_non_empty_strings(12345, MagicMock(field_name="host"))
+
+    # 7. PipelineConfig work_dir, log_format, and log_file validators
+    with pytest.raises((TypeError, ValidationError)):
+        PipelineConfig(work_dir=12345)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="log_format must be a string"):
+        PipelineConfig.validate_log_format(123)  # type: ignore[arg-type]
+    assert PipelineConfig.validate_log_file("none") is None
+    assert PipelineConfig.validate_log_file("null") is None
+    assert PipelineConfig.validate_log_file("   ") is None
+    assert PipelineConfig.validate_log_file(Path("/tmp/run.log")) == Path("/tmp/run.log")
+    with pytest.raises(TypeError, match="Invalid type for log_file"):
+        PipelineConfig.validate_log_file(12345)
+
 

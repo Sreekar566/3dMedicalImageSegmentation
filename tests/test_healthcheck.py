@@ -224,3 +224,34 @@ def test_check_database_disposes_engine() -> None:
         assert result["status"] == "ok"
         mock_dispose.assert_called_once()
 
+
+def test_diagnostics_check_simpleitk_and_check_database_exceptions() -> None:
+    """Verify check_simpleitk and check_database capture and report internal unhandled exceptions."""
+    # 1. check_simpleitk error handling
+    with patch("SimpleITK.Image", side_effect=RuntimeError("SimpleITK allocation failed")):
+        sitk_res = check_simpleitk()
+        assert sitk_res["status"] == "error"
+        assert "SimpleITK allocation failed" in sitk_res["error"]
+
+    # 2. check_database unhandled exception handling
+    with patch("medical_segmentation.db.database.DatabaseManager", side_effect=RuntimeError("DatabaseManager crash")):
+        db_res = check_database(DatabaseSettings())
+        assert db_res["status"] == "error"
+        assert "DatabaseManager crash" in db_res["error"]
+
+
+def test_run_health_check_unhealthy_mixed_component_logging() -> None:
+    """Verify run_health_check logs both passing and failing components when overall status is unhealthy."""
+    mixed_results = {
+        "status": "unhealthy",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "components": {
+            "python": {"status": "ok", "version": "3.12"},
+            "monai": {"status": "error", "error": "Import error"},
+        },
+    }
+    with patch("medical_segmentation.main.check_system_health", return_value=mixed_results):
+        exit_code = run_health_check()
+        assert exit_code == 1
+
+

@@ -11,8 +11,11 @@ import logging
 import sys
 from pathlib import Path
 from typing import Any, Dict
+from unittest.mock import patch
 
+import numpy as np
 import pytest
+import torch
 from pydantic import ValidationError
 
 from medical_segmentation.config import PipelineConfig
@@ -297,3 +300,109 @@ def test_cli_main_reconfigures_logging(monkeypatch: pytest.MonkeyPatch, tmp_path
     parsed_record = json.loads(first_line)
     assert "timestamp" in parsed_record
     assert parsed_record["level"] in ("INFO", "DEBUG")
+
+
+def test_safe_json_serializer_numpy_and_torch_types() -> None:
+    """Verify _safe_json_serializer correctly serializes numpy scalars, arrays, torch tensors, and devices."""
+    # Numpy scalars
+    assert _safe_json_serializer(np.int32(42)) == 42
+    assert _safe_json_serializer(np.int64(100)) == 100
+    assert _safe_json_serializer(np.float32(3.14)) == pytest.approx(3.14, rel=1e-3)
+    assert _safe_json_serializer(np.float64(2.718)) == pytest.approx(2.718, rel=1e-3)
+
+    # Numpy arrays: small array (<= 20 elements) converts to list
+    small_arr = np.array([1, 2, 3, 4])
+    assert _safe_json_serializer(small_arr) == [1, 2, 3, 4]
+
+    # Numpy arrays: large array (> 20 elements) converts to descriptor string
+    large_arr = np.zeros((5, 5))
+    serialized_large = _safe_json_serializer(large_arr)
+    assert "<ndarray shape=(5, 5) dtype=float64>" in serialized_large
+
+    # PyTorch device and tensor
+    device = torch.device("cpu")
+    assert _safe_json_serializer(device) == "cpu"
+
+    tensor = torch.zeros((1, 2, 3), dtype=torch.float32)
+    serialized_tensor = _safe_json_serializer(tensor)
+    assert "<Tensor shape=(1, 2, 3) dtype=torch.float32>" == serialized_tensor
+
+    # Fallback when item() raises an exception
+    class int_scalar:
+        def item(self):
+            raise RuntimeError("item error")
+
+        def __str__(self):
+            return "fallback_scalar_str"
+
+    assert _safe_json_serializer(int_scalar()) == "fallback_scalar_str"
+
+
+def test_structured_json_formatter_stack_info_and_message_exception() -> None:
+    """Verify StructuredJsonFormatter handles stack_info and formatting errors in record.msg."""
+    formatter = StructuredJsonFormatter()
+
+    # Stack info handling
+    record_stack = logging.LogRecord(
+        name="test_stack",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=50,
+        msg="Stack dump test",
+        args=(),
+        exc_info=None,
+    )
+    record_stack.stack_info = "Traceback (most recent call last):\n  File 'test.py', line 1"
+    output_stack = formatter.format(record_stack)
+    data_stack = json.loads(output_stack)
+    assert "stack_info" in data_stack
+    assert "Traceback" in data_stack["stack_info"]
+
+    # Formatting error in getMessage()
+    record_bad_args = logging.LogRecord(
+        name="test_bad_msg",
+        level=logging.WARNING,
+        pathname=__file__,
+        lineno=60,
+        msg="Expected %d integers but got %d",
+        args=("only_one",),  # Type/count mismatch causes record.getMessage() to raise
+        exc_info=None,
+    )
+    output_bad_args = formatter.format(record_bad_args)
+    data_bad_args = json.loads(output_bad_args)
+    assert data_bad_args["message"] == "Expected %d integers but got %d"
+
+
+def test_configure_logging_error_resilience(tmp_path: Path) -> None:
+    """Verify configure_logging gracefully handles handler close failures and unwritable file logs."""
+    logger_name = "test_resilience_logger"
+    logger = logging.getLogger(logger_name)
+
+    # 1. Existing handler that fails on close()
+    class BrokenHandler(logging.Handler):
+        def close(self) -> None:
+            raise RuntimeError("Close failed")
+
+    broken_h = BrokenHandler()
+    logger.addHandler(broken_h)
+
+    # force=True should remove and attempt to close handlers without failing
+    reconfigured = configure_logging(
+        level="INFO",
+        log_format="text",
+        root_logger_name=logger_name,
+        force=True,
+    )
+    assert reconfigured.name == logger_name
+
+    # 2. File handler initialization failure (e.g. uncreatable path)
+    with patch("pathlib.Path.mkdir", side_effect=PermissionError("Permission denied")):
+        resilient_logger = configure_logging(
+            level="INFO",
+            log_format="text",
+            log_file=tmp_path / "forbidden" / "test.log",
+            root_logger_name="test_file_fail_logger",
+            force=True,
+        )
+        assert resilient_logger.name == "test_file_fail_logger"
+

@@ -867,3 +867,23 @@ def test_build_volume_metric_and_metrics_standalone(sample_metrics: Segmentation
 
     with pytest.raises(TypeError, match="label must be a LabelSummaryMetric instance"):
         build_volume_metric(run_id=1, label=None)  # type: ignore[arg-type]
+
+
+def test_database_manager_close_and_dispose_resilience() -> None:
+    """Verify DatabaseManager.close() aliases dispose() and dispose() handles engine disposal exceptions."""
+    sqlite_engine = create_engine("sqlite:///:memory:")
+    settings = DatabaseSettings()
+    db_mgr = DatabaseManager(settings=settings, engine=sqlite_engine)
+
+    # close() calls dispose()
+    with patch.object(db_mgr, "dispose") as mock_dispose:
+        db_mgr.close()
+        mock_dispose.assert_called_once()
+
+    # dispose() exception resilience
+    mock_bad_engine = MagicMock()
+    mock_bad_engine.dispose.side_effect = SQLAlchemyError("Engine teardown error")
+    db_bad = DatabaseManager(settings=settings, engine=mock_bad_engine)
+    # Should log warning and not raise
+    db_bad.dispose()
+

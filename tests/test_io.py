@@ -1392,6 +1392,68 @@ def test_dicom_volume_loader_load_polymorphic_interface(tmp_path: Path) -> None:
     assert loader.orient_geometry is orient_and_populate_geometry
 
 
+def test_extract_volume_file_metadata_dcm_fallback_uids(tmp_path: Path) -> None:
+    """Verify extract_volume_file_metadata assigns fallback UIDs if a standalone .dcm file lacks them."""
+    slice_path = tmp_path / "orphan_study_series.dcm"
+    file_meta = FileMetaDataset()
+    file_meta.MediaStorageSOPClassUID = pydicom.uid.CTImageStorage
+    file_meta.MediaStorageSOPInstanceUID = pydicom.uid.generate_uid()
+    file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
+
+    ds = Dataset()
+    ds.file_meta = file_meta
+    ds.PatientID = "PATIENT_ORPHAN"
+    ds.Modality = "CT"
+    # Explicitly empty UIDs
+    ds.StudyInstanceUID = ""
+    ds.SeriesInstanceUID = ""
+
+    pydicom.dcmwrite(str(slice_path), ds, enforce_file_format=True)
+
+    meta = extract_volume_file_metadata(slice_path)
+    assert meta.patient_id == "PATIENT_ORPHAN"
+    assert meta.study_instance_uid == "orphan_study_series"
+    assert meta.series_instance_uid == "orphan_study_series.dcm"
+
+
+def test_resolve_dicom_series_files_empty_results_raises_value_error(tmp_path: Path) -> None:
+    """Verify resolve_dicom_series_files raises ValueError when series file discovery returns no files."""
+    series_dir = tmp_path / "empty_series_dir"
+    series_dir.mkdir()
+
+    with patch("SimpleITK.ImageSeriesReader.GetGDCMSeriesIDs", return_value=["1.2.3.4"]), \
+         patch("SimpleITK.ImageSeriesReader.GetGDCMSeriesFileNames", return_value=[]):
+        with pytest.raises(ValueError, match="Could not retrieve DICOM slice filenames from"):
+            resolve_dicom_series_files(series_dir)
+
+
+def test_volumetric_metadata_direction_matrix_dominant_coronal_and_sagittal() -> None:
+    """Verify get_slice_plane_and_position resolves coronal and sagittal planes via direction matrix."""
+    # Coronal: dominant Y axis (axis index 1 in [2, 5, 8])
+    # direction: [X_x, X_y, X_z,  Y_x, Y_y, Y_z,  Z_x, Z_y, Z_z]
+    # Here Z direction is (0, 1, 0), so indices 2=0, 5=1, 8=0 -> argmax is index 1 -> coronal
+    coronal_meta = VolumetricMetadata(
+        origin=(10.0, 20.0, 30.0),
+        spacing=(1.0, 1.0, 1.0),
+        direction=(1.0, 0.0, 0.0,  0.0, 0.0, 1.0,  0.0, 1.0, 0.0),
+        spatial_orientation="",
+    )
+    plane, _ = coronal_meta.get_slice_plane_and_position(5)
+    assert plane == "coronal"
+
+    # Sagittal: dominant X axis (axis index 0 in [2, 5, 8])
+    # Here dir[2]=1.0, dir[5]=0.0, dir[8]=0.0 -> argmax is index 0 -> sagittal
+    sagittal_meta = VolumetricMetadata(
+        origin=(10.0, 20.0, 30.0),
+        spacing=(1.0, 1.0, 1.0),
+        direction=(0.0, 0.0, 1.0,  1.0, 0.0, 0.0,  0.0, 1.0, 0.0),
+        spatial_orientation="",
+    )
+    plane_sag, _ = sagittal_meta.get_slice_plane_and_position(5)
+    assert plane_sag == "sagittal"
+
+
+
 
 
 
