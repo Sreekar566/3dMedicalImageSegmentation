@@ -6,6 +6,7 @@ Extracts clinical metadata via pydicom and standardizes spatial coordinates via 
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -35,18 +36,20 @@ def safe_parse_float(value: Any, default: Optional[float] = None) -> Optional[fl
     """
     Safely parse a DICOM header value into a float.
     Handles None, empty strings, lists, tuples, pydicom MultiValue,
-    backslash-delimited strings, and conversion exceptions.
+    backslash-delimited strings, booleans, non-finite values (NaN/Inf),
+    and conversion exceptions.
     """
-    if value is None:
+    if value is None or isinstance(value, bool):
         return default
     if isinstance(value, (list, tuple, Sequence)) and not isinstance(value, (str, bytes)):
         if len(value) == 0:
             return default
         value = value[0]
-        if value is None:
+        if value is None or isinstance(value, bool):
             return default
     if isinstance(value, (int, float)):
-        return float(value)
+        val = float(value)
+        return val if math.isfinite(val) else default
     if isinstance(value, (str, bytes)):
         clean = (value.decode("utf-8", errors="ignore") if isinstance(value, bytes) else value).strip()
         if not clean or clean.lower() in ("none", "null"):
@@ -54,11 +57,13 @@ def safe_parse_float(value: Any, default: Optional[float] = None) -> Optional[fl
         if "\\" in clean:
             clean = clean.split("\\")[0].strip()
         try:
-            return float(clean)
+            val = float(clean)
+            return val if math.isfinite(val) else default
         except (ValueError, TypeError):
             return default
     try:
-        return float(value)
+        val = float(value)
+        return val if math.isfinite(val) else default
     except (ValueError, TypeError):
         return default
 
@@ -66,10 +71,16 @@ def safe_parse_float(value: Any, default: Optional[float] = None) -> Optional[fl
 def safe_parse_str(value: Any, default: str = "") -> str:
     """
     Safely parse a DICOM header value into a clean string.
-    Normalizes None, 'None', empty strings, and whitespace to default.
+    Normalizes None, 'None', empty strings, whitespace, and MultiValue sequences to default or clean string.
     """
-    if value is None:
+    if value is None or isinstance(value, bool):
         return default
+    if isinstance(value, (list, tuple, Sequence)) and not isinstance(value, (str, bytes)):
+        if len(value) == 0:
+            return default
+        value = value[0]
+        if value is None or isinstance(value, bool):
+            return default
     s = str(value).strip()
     if not s or s.lower() in ("none", "null"):
         return default
@@ -126,7 +137,16 @@ class VolumetricMetadata:
         Returns:
             Tuple of (plane_name, slice_position_mm).
         """
-        pt = self.continuous_index_to_physical_point((0.0, 0.0, float(slice_index)))
+        if isinstance(slice_index, bool):
+            raise TypeError("slice_index cannot be a boolean value.")
+        try:
+            sz = float(slice_index)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"slice_index must be a valid number: {exc}") from exc
+        if not math.isfinite(sz):
+            raise ValueError(f"slice_index must be a finite number, got {slice_index}.")
+
+        pt = self.continuous_index_to_physical_point((0.0, 0.0, sz))
 
         orient = self.spatial_orientation.upper() if self.spatial_orientation else ""
         if len(orient) == 3:
@@ -156,6 +176,7 @@ class VolumetricMetadata:
         """
         Transform continuous voxel index (X, Y, Z) to physical patient coordinate (x, y, z) in mm,
         accounting for origin, voxel spacing, and 3D direction cosine matrix.
+        Safely normalizes truncated or missing spacing and origin coordinates.
 
         Args:
             continuous_index: Continuous index sequence (cx, cy, cz) in voxel coordinates.
@@ -167,9 +188,20 @@ class VolumetricMetadata:
             raise ValueError(
                 f"continuous_index must contain exactly 3 coordinates (cx, cy, cz), got {len(continuous_index)}."
             )
-        cx, cy, cz = continuous_index
-        dx, dy, dz = self.spacing
-        ox, oy, oz = self.origin
+        if any(isinstance(c, bool) for c in continuous_index):
+            raise TypeError("continuous_index coordinates cannot be boolean values.")
+        try:
+            cx, cy, cz = (float(c) for c in continuous_index)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"continuous_index coordinates must be valid numbers: {exc}") from exc
+        if any(not math.isfinite(c) for c in (cx, cy, cz)):
+            raise ValueError(f"continuous_index coordinates must be finite numbers, got {continuous_index}.")
+
+        raw_sp = tuple(self.spacing) if getattr(self, "spacing", None) else ()
+        dx, dy, dz = (raw_sp + (1.0, 1.0, 1.0))[:3]
+
+        raw_org = tuple(self.origin) if getattr(self, "origin", None) else ()
+        ox, oy, oz = (raw_org + (0.0, 0.0, 0.0))[:3]
 
         if len(self.direction) == 9:
             d = self.direction

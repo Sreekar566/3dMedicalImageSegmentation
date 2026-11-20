@@ -44,7 +44,13 @@ def validate_input_sources(
     """
     clean_blob = blob_path.strip() if isinstance(blob_path, str) and blob_path.strip() else None
     clean_prefix = series_prefix.strip() if isinstance(series_prefix, str) and series_prefix.strip() else None
-    clean_local = Path(local_input).resolve() if local_input is not None and str(local_input).strip() else None
+    clean_local = (
+        Path(local_input).resolve()
+        if local_input is not None
+        and str(local_input).strip()
+        and str(local_input).strip() not in (".", "none", "null")
+        else None
+    )
 
     inputs_provided = sum(1 for x in (clean_blob, clean_prefix, clean_local) if x is not None)
     if inputs_provided == 0:

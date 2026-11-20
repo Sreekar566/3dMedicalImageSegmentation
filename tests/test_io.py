@@ -744,6 +744,24 @@ def test_safe_parse_float_and_str_edge_cases() -> None:
     assert safe_parse_float("not_a_float", 0.0) == 0.0
     assert safe_parse_float(None) is None
 
+    # Rejection of booleans (which are subclasses of int in Python)
+    assert safe_parse_float(True, 0.0) == 0.0
+    assert safe_parse_float(False, 0.0) == 0.0
+    assert safe_parse_float([True], 0.0) == 0.0
+    assert safe_parse_float([False], 0.0) == 0.0
+
+    # Rejection of non-finite floats (NaN, Inf, -Inf)
+    assert safe_parse_float(float("nan"), 0.0) == 0.0
+    assert safe_parse_float(float("inf"), 0.0) == 0.0
+    assert safe_parse_float(float("-inf"), 0.0) == 0.0
+    assert safe_parse_float("nan", 0.0) == 0.0
+    assert safe_parse_float("NaN", 0.0) == 0.0
+    assert safe_parse_float("inf", 0.0) == 0.0
+    assert safe_parse_float("-inf", 0.0) == 0.0
+    assert safe_parse_float("Infinity", 0.0) == 0.0
+    assert safe_parse_float("-Infinity", 0.0) == 0.0
+    assert safe_parse_float(["nan"], 0.0) == 0.0
+
     # safe_parse_str
     assert safe_parse_str(None, "ANONYMOUS") == "ANONYMOUS"
     assert safe_parse_str("", "ANONYMOUS") == "ANONYMOUS"
@@ -752,6 +770,15 @@ def test_safe_parse_float_and_str_edge_cases() -> None:
     assert safe_parse_str("null", "ANONYMOUS") == "ANONYMOUS"
     assert safe_parse_str("  PATIENT_123  ", "ANONYMOUS") == "PATIENT_123"
     assert safe_parse_str("CT", "CT") == "CT"
+
+    # safe_parse_str with booleans and sequences
+    assert safe_parse_str(True, "ANONYMOUS") == "ANONYMOUS"
+    assert safe_parse_str(False, "ANONYMOUS") == "ANONYMOUS"
+    assert safe_parse_str(["PATIENT_456"], "ANONYMOUS") == "PATIENT_456"
+    assert safe_parse_str(("SERIES_01",), "ANONYMOUS") == "SERIES_01"
+    assert safe_parse_str([], "ANONYMOUS") == "ANONYMOUS"
+    assert safe_parse_str([None], "ANONYMOUS") == "ANONYMOUS"
+    assert safe_parse_str([True], "ANONYMOUS") == "ANONYMOUS"
 
 
 def test_dicom_volume_loader_extract_pydicom_metadata_empty_and_malformed_tags(tmp_path: Path) -> None:
@@ -1169,6 +1196,63 @@ def test_volume_ingester_validation_errors(tmp_path: Path) -> None:
     ingester = VolumeIngester(azure_client=mock_azure, workspace=tmp_path)
     with pytest.raises(ValueError, match="Invalid Azure Blob container name"):
         ingester.ingest(blob_path="vol.nii.gz", input_container="INVALID_CONTAINER")
+
+
+def test_volumetric_metadata_continuous_index_robustness() -> None:
+    """Verify continuous_index_to_physical_point and get_slice_plane_and_position handle malformed/truncated tuples and validate inputs."""
+    # 1. Truncated spacing tuple (e.g. 1 element) safely padded with 1.0
+    meta_short = VolumetricMetadata(
+        spacing=(2.5,),
+        origin=(10.0,),
+    )
+    pt = meta_short.continuous_index_to_physical_point((2.0, 3.0, 4.0))
+    # px = 10.0 + 2.0 * 2.5 = 15.0; py = 0.0 + 3.0 * 1.0 = 3.0; pz = 0.0 + 4.0 * 1.0 = 4.0
+    assert pt == (15.0, 3.0, 4.0)
+
+    # 2. get_slice_plane_and_position works with truncated spacing/origin
+    plane, pos = meta_short.get_slice_plane_and_position(5)
+    assert plane == "axial"
+    assert pos == 5.0
+
+    # 3. Rejection of boolean coordinates
+    with pytest.raises(TypeError, match="coordinates cannot be boolean"):
+        meta_short.continuous_index_to_physical_point((True, 1.0, 2.0))
+
+    # 4. Rejection of non-numeric coordinates
+    with pytest.raises(ValueError, match="coordinates must be valid numbers"):
+        meta_short.continuous_index_to_physical_point(("not_a_num", 1.0, 2.0))
+
+    # 5. Rejection of non-finite coordinates (NaN/Inf)
+    with pytest.raises(ValueError, match="coordinates must be finite"):
+        meta_short.continuous_index_to_physical_point((float("nan"), 1.0, 2.0))
+    with pytest.raises(ValueError, match="coordinates must be finite"):
+        meta_short.continuous_index_to_physical_point((float("inf"), 1.0, 2.0))
+
+    # 6. get_slice_plane_and_position input validation
+    with pytest.raises(TypeError, match="slice_index cannot be a boolean"):
+        meta_short.get_slice_plane_and_position(True)
+    with pytest.raises(ValueError, match="slice_index must be a valid number"):
+        meta_short.get_slice_plane_and_position("invalid")
+    with pytest.raises(ValueError, match="slice_index must be a finite number"):
+        meta_short.get_slice_plane_and_position(float("nan"))
+    with pytest.raises(ValueError, match="slice_index must be a finite number"):
+        meta_short.get_slice_plane_and_position(float("inf"))
+
+
+def test_validate_input_sources_empty_and_dot_paths() -> None:
+    """Verify validate_input_sources rejects empty/dot Path objects and placeholder strings."""
+    with pytest.raises(ValueError, match="No input volume source specified"):
+        validate_input_sources(local_input=Path(""))
+
+    with pytest.raises(ValueError, match="No input volume source specified"):
+        validate_input_sources(local_input=Path("."))
+
+    with pytest.raises(ValueError, match="No input volume source specified"):
+        validate_input_sources(local_input="none")
+
+    with pytest.raises(ValueError, match="No input volume source specified"):
+        validate_input_sources(local_input="null")
+
 
 
 

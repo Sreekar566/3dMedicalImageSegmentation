@@ -267,7 +267,7 @@ class VolumetricMetricsCalculator:
         pixel_area = (
             metadata.pixel_area_slice_mm2
             if hasattr(metadata, "pixel_area_slice_mm2")
-            else metadata.pixel_area_axial_mm2
+            else getattr(metadata, "pixel_area_axial_mm2", 1.0)
         )
 
         plane = self._resolve_slice_plane(metadata)

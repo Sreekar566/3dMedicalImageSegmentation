@@ -510,6 +510,35 @@ def test_execute_inference_binary_channel() -> None:
     assert set(np.unique(mask)).issubset({0, 1})
 
 
+def test_execute_inference_large_label_uint16() -> None:
+    """Validate SlidingWindowInferenceEngine uses uint16 to prevent overflow when out_channels > 256."""
+    settings = InferenceSettings(
+        roi_size=(16, 16, 16),
+        sw_batch_size=1,
+        overlap=0.25,
+        in_channels=1,
+        out_channels=300,
+        device="cpu",
+    )
+    # Mock model returning logits of shape (1, 300, D, H, W) where channel 260 has highest logit
+    class LargeChannelMockModel(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            batch, _, d, h, w = x.shape
+            out = torch.zeros(batch, 300, d, h, w, device=x.device, dtype=x.dtype)
+            out[:, 260, :, :, :] = 10.0
+            return out
+
+    model = LargeChannelMockModel()
+    inferer = SlidingWindowInferenceEngine(model=model, settings=settings)
+
+    volume_tensor = torch.zeros(1, 1, 16, 16, 16)
+    mask = inferer.execute_inference(volume_tensor)
+
+    assert mask.shape == (16, 16, 16)
+    assert mask.dtype == np.uint16
+    assert (mask == 260).all()
+
+
 def test_volumetric_metadata_slice_plane_and_position_all_anatomical_planes() -> None:
     """Validate that VolumetricMetadata determines correct anatomical planes and positions for axial, coronal, and sagittal orientations."""
     # 1. Axial orientation (RAS)

@@ -111,7 +111,8 @@ class SlidingWindowInferenceEngine:
         elapsed = time.perf_counter() - start_time
         logger.info("3D inference completed in %.2f seconds.", elapsed)
 
-        mask_np = discrete_mask.cpu().numpy().astype(np.uint8)
+        mask_dtype = np.uint16 if self.settings.out_channels > 256 else np.uint8
+        mask_np = discrete_mask.cpu().numpy().astype(mask_dtype)
         return mask_np
 
     def compute_metrics(
