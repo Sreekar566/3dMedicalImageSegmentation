@@ -195,7 +195,9 @@ class PipelineOrchestrator:
             "Standardizing volume geometry (sitk.DICOMOrient -> %s)...",
             self.volume_loader.target_orientation,
         )
-        if is_dicom_dir:
+        if hasattr(self.volume_loader, "load"):
+            sitk_image, metadata = self.volume_loader.load(target_path, is_dicom_dir=is_dicom_dir)
+        elif is_dicom_dir:
             sitk_image, metadata = self.volume_loader.load_dicom_series(target_path)
         else:
             sitk_image, metadata = self.volume_loader.load_volume_file(target_path)

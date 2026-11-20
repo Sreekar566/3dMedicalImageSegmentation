@@ -25,6 +25,9 @@ __all__ = [
     "DicomVolumeLoader",
     "VolumetricMetadata",
     "extract_pydicom_metadata",
+    "extract_volume_file_metadata",
+    "orient_and_populate_geometry",
+    "resolve_dicom_series_files",
     "safe_parse_float",
     "safe_parse_str",
     "save_mask_as_nifti",
@@ -225,6 +228,134 @@ def sitk_to_numpy(image: sitk.Image) -> np.ndarray:
     return sitk.GetArrayFromImage(image).astype(np.float32)
 
 
+def resolve_dicom_series_files(
+    directory_path: Path | str,
+    series_id: Optional[str] = None,
+    series_reader: Optional[sitk.ImageSeriesReader] = None,
+) -> List[str]:
+    """
+    Scan a directory for a 3D DICOM series and resolve sorted slice file paths.
+    Uses SimpleITK ImageSeriesReader GDCM series detection, falling back to direct
+    DICOM file globbing (*.dcm, *.DCM) if GDCM series IDs are not found.
+
+    Args:
+        directory_path: Local folder containing DICOM slices.
+        series_id: Optional specific DICOM SeriesInstanceUID to select.
+        series_reader: Optional pre-instantiated SimpleITK ImageSeriesReader.
+
+    Returns:
+        List of absolute string file paths for the series slices.
+
+    Raises:
+        FileNotFoundError: If directory_path does not exist or is not a directory.
+        ValueError: If no valid DICOM files or series slices are found.
+    """
+    dir_path = Path(directory_path).resolve()
+    if not dir_path.is_dir():
+        raise FileNotFoundError(f"DICOM series directory not found: {dir_path}")
+
+    logger.info("Scanning directory '%s' for DICOM series...", dir_path)
+    reader = series_reader if series_reader is not None else sitk.ImageSeriesReader()
+    series_ids = reader.GetGDCMSeriesIDs(str(dir_path))
+
+    if not series_ids:
+        # Fallback: check if directory contains individual DICOM files directly
+        # Deduplicate matching files for case-insensitive filesystems
+        dcm_files = sorted(set(list(dir_path.glob("*.dcm")) + list(dir_path.glob("*.DCM"))))
+        if not dcm_files:
+            raise ValueError(f"No valid DICOM series or .dcm files found in: {dir_path}")
+        logger.info("Directly reading %d DICOM files...", len(dcm_files))
+        file_names = [str(f) for f in dcm_files]
+    else:
+        selected_series_id = series_id or series_ids[0]
+        logger.info("Found %d series. Loading series ID: '%s'", len(series_ids), selected_series_id)
+        file_names = list(reader.GetGDCMSeriesFileNames(str(dir_path), selected_series_id))
+
+    if not file_names:
+        raise ValueError(f"Could not retrieve DICOM slice filenames from: {dir_path}")
+
+    return file_names
+
+
+def extract_volume_file_metadata(
+    file_path: Path | str,
+    fallback_modality: Optional[str] = None,
+) -> VolumetricMetadata:
+    """
+    Extract or generate VolumetricMetadata for a standalone 3D volumetric file.
+    Extracts clinical DICOM header attributes from standalone DICOM files (.dcm, .ima),
+    or infers study UID and modality heuristics for NIfTI / other volumetric formats.
+
+    Args:
+        file_path: Path to the 3D volume file.
+        fallback_modality: Optional modality override ("CT" or "MRI").
+
+    Returns:
+        Populated VolumetricMetadata instance.
+
+    Raises:
+        FileNotFoundError: If file_path does not exist or is not a file.
+    """
+    target_file = Path(file_path).resolve()
+    if not target_file.is_file():
+        raise FileNotFoundError(f"Volume file not found: {target_file}")
+
+    file_name_lower = target_file.name.lower()
+    if file_name_lower.endswith(".nii.gz"):
+        study_uid = target_file.name[:-7]
+    else:
+        study_uid = target_file.stem
+
+    if target_file.suffix.lower() in (".dcm", ".ima"):
+        metadata = extract_pydicom_metadata(target_file)
+        if not metadata.study_instance_uid:
+            metadata.study_instance_uid = study_uid
+        if not metadata.series_instance_uid:
+            metadata.series_instance_uid = target_file.name
+    else:
+        default_modality = (
+            fallback_modality.upper().strip()
+            if fallback_modality
+            else ("CT" if "ct" in file_name_lower else "MRI")
+        )
+        metadata = VolumetricMetadata(
+            study_instance_uid=study_uid,
+            series_instance_uid=target_file.name,
+            modality=default_modality,
+        )
+    return metadata
+
+
+def orient_and_populate_geometry(
+    volume: sitk.Image,
+    metadata: VolumetricMetadata,
+    target_orientation: str = "RAS",
+) -> Tuple[sitk.Image, VolumetricMetadata]:
+    """
+    Standardize volume orientation using sitk.DICOMOrient and update physical metadata.
+
+    Args:
+        volume: Input SimpleITK 3D image.
+        metadata: Clinical/geometric VolumetricMetadata to update.
+        target_orientation: Target 3-letter orientation code (e.g., "RAS", "LPS").
+
+    Returns:
+        Tuple of (oriented sitk.Image, updated VolumetricMetadata).
+    """
+    clean_orientation = validate_orientation_code(target_orientation)
+    logger.info("Applying sitk.DICOMOrient(target='%s')...", clean_orientation)
+    oriented_image = sitk.DICOMOrient(volume, clean_orientation)
+
+    # Update metadata with post-orientation physical parameters
+    metadata.dimensions = oriented_image.GetSize()  # (X, Y, Z)
+    metadata.spacing = oriented_image.GetSpacing()  # (dx, dy, dz)
+    metadata.origin = oriented_image.GetOrigin()    # (ox, oy, oz)
+    metadata.direction = oriented_image.GetDirection()
+    metadata.spatial_orientation = clean_orientation
+
+    return oriented_image, metadata
+
+
 class DicomVolumeLoader:
     """Robust volumetric medical image ingestion engine supporting DICOM series and NIfTI volumes."""
 
@@ -254,29 +385,12 @@ class DicomVolumeLoader:
         Returns:
             Tuple of (Standardized sitk.Image in target orientation, VolumetricMetadata).
         """
-        dir_path = Path(directory_path).resolve()
-        if not dir_path.is_dir():
-            raise FileNotFoundError(f"DICOM series directory not found: {dir_path}")
-
-        logger.info("Scanning directory '%s' for DICOM series...", dir_path)
         series_reader = sitk.ImageSeriesReader()
-        series_ids = series_reader.GetGDCMSeriesIDs(str(dir_path))
-
-        if not series_ids:
-            # Fallback: check if directory contains individual DICOM files directly
-            # Deduplicate matching files for case-insensitive filesystems
-            dcm_files = sorted(set(list(dir_path.glob("*.dcm")) + list(dir_path.glob("*.DCM"))))
-            if not dcm_files:
-                raise ValueError(f"No valid DICOM series or .dcm files found in: {dir_path}")
-            logger.info("Directly reading %d DICOM files...", len(dcm_files))
-            file_names = [str(f) for f in dcm_files]
-        else:
-            selected_series_id = series_id or series_ids[0]
-            logger.info("Found %d series. Loading series ID: '%s'", len(series_ids), selected_series_id)
-            file_names = series_reader.GetGDCMSeriesFileNames(str(dir_path), selected_series_id)
-
-        if not file_names:
-            raise ValueError(f"Could not retrieve DICOM slice filenames from: {dir_path}")
+        file_names = resolve_dicom_series_files(
+            directory_path=directory_path,
+            series_id=series_id,
+            series_reader=series_reader,
+        )
 
         # 1. Extract clinical tags from the first slice using pydicom
         metadata = self._extract_pydicom_metadata(Path(file_names[0]))
@@ -314,30 +428,35 @@ class DicomVolumeLoader:
 
         logger.info("Reading 3D volumetric file: '%s'", target_file)
         raw_volume = sitk.ReadImage(str(target_file))
-
-        # Determine clean base identifier without archive extensions (.nii.gz -> base)
-        file_name_lower = target_file.name.lower()
-        if file_name_lower.endswith(".nii.gz"):
-            study_uid = target_file.name[:-7]
-        else:
-            study_uid = target_file.stem
-
-        if target_file.suffix.lower() in (".dcm", ".ima"):
-            metadata = self._extract_pydicom_metadata(target_file)
-            if not metadata.study_instance_uid:
-                metadata.study_instance_uid = study_uid
-            if not metadata.series_instance_uid:
-                metadata.series_instance_uid = target_file.name
-        else:
-            metadata = VolumetricMetadata(
-                study_instance_uid=study_uid,
-                series_instance_uid=target_file.name,
-                modality="CT" if "ct" in target_file.name.lower() else "MRI",
-            )
+        metadata = extract_volume_file_metadata(target_file)
 
         # Orient volume and populate physical coordinate geometry
         oriented_volume, metadata = self._orient_and_populate_geometry(raw_volume, metadata)
         return oriented_volume, metadata
+
+    def load(
+        self,
+        path: Path | str,
+        is_dicom_dir: Optional[bool] = None,
+        series_id: Optional[str] = None,
+    ) -> Tuple[sitk.Image, VolumetricMetadata]:
+        """
+        Unified loading interface for 3D medical volumes.
+        Automatically detects whether path is a directory (DICOM series) or file (NIfTI / DICOM).
+
+        Args:
+            path: Local path to DICOM directory or 3D volume file.
+            is_dicom_dir: Optional explicit override specifying if path is a DICOM series directory.
+            series_id: Optional specific DICOM SeriesInstanceUID to load when loading from directory.
+
+        Returns:
+            Tuple of (Oriented sitk.Image in target orientation, VolumetricMetadata).
+        """
+        resolved_path = Path(path).resolve()
+        is_dir = resolved_path.is_dir() if is_dicom_dir is None else bool(is_dicom_dir)
+        if is_dir:
+            return self.load_dicom_series(resolved_path, series_id=series_id)
+        return self.load_volume_file(resolved_path)
 
     def _orient_and_populate_geometry(
         self,
@@ -346,23 +465,21 @@ class DicomVolumeLoader:
     ) -> Tuple[sitk.Image, VolumetricMetadata]:
         """
         Standardize volume orientation using sitk.DICOMOrient and update physical metadata.
+        Delegates to orient_and_populate_geometry.
         """
-        logger.info("Applying sitk.DICOMOrient(target='%s')...", self.target_orientation)
-        oriented_image = sitk.DICOMOrient(volume, self.target_orientation)
-
-        # Update metadata with post-orientation physical parameters
-        metadata.dimensions = oriented_image.GetSize()  # (X, Y, Z)
-        metadata.spacing = oriented_image.GetSpacing()  # (dx, dy, dz)
-        metadata.origin = oriented_image.GetOrigin()    # (ox, oy, oz)
-        metadata.direction = oriented_image.GetDirection()
-        metadata.spatial_orientation = self.target_orientation
-
-        return oriented_image, metadata
+        return orient_and_populate_geometry(
+            volume=volume,
+            metadata=metadata,
+            target_orientation=self.target_orientation,
+        )
 
     def _extract_pydicom_metadata(self, sample_slice_path: Path | str) -> VolumetricMetadata:
         """Parse DICOM header attributes from a slice using pydicom."""
         return extract_pydicom_metadata(sample_slice_path)
 
+    resolve_series_files = staticmethod(resolve_dicom_series_files)
+    extract_file_metadata = staticmethod(extract_volume_file_metadata)
+    orient_geometry = staticmethod(orient_and_populate_geometry)
     sitk_to_numpy = staticmethod(sitk_to_numpy)
     save_mask_as_nifti = staticmethod(save_mask_as_nifti)
 

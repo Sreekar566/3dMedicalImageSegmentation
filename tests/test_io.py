@@ -25,6 +25,9 @@ from medical_segmentation.io.dicom_loader import (
     DicomVolumeLoader,
     VolumetricMetadata,
     extract_pydicom_metadata,
+    extract_volume_file_metadata,
+    orient_and_populate_geometry,
+    resolve_dicom_series_files,
     safe_parse_float,
     safe_parse_str,
     sitk_to_numpy,
@@ -1252,6 +1255,142 @@ def test_validate_input_sources_empty_and_dot_paths() -> None:
 
     with pytest.raises(ValueError, match="No input volume source specified"):
         validate_input_sources(local_input="null")
+
+
+def test_resolve_dicom_series_files_decoupled(tmp_path: Path) -> None:
+    """Validate standalone resolve_dicom_series_files slice discovery, fallback globbing, and errors."""
+    # 1. Missing directory raises FileNotFoundError
+    with pytest.raises(FileNotFoundError, match="DICOM series directory not found"):
+        resolve_dicom_series_files(tmp_path / "non_existent_folder")
+
+    # 2. Empty directory raises ValueError
+    empty_dir = tmp_path / "empty_dir"
+    empty_dir.mkdir()
+    with pytest.raises(ValueError, match="No valid DICOM series or .dcm files found"):
+        resolve_dicom_series_files(empty_dir)
+
+    # 3. Direct .dcm files fallback when no GDCM series IDs are detected
+    dcm_dir = tmp_path / "direct_dcm_dir"
+    dcm_dir.mkdir()
+    slice_1 = dcm_dir / "slice_b.dcm"
+    slice_2 = dcm_dir / "slice_a.dcm"
+    _create_synthetic_dicom_slice(slice_1, slice_idx=1)
+    _create_synthetic_dicom_slice(slice_2, slice_idx=0)
+
+    # Mock GDCM series IDs to return empty to exercise fallback
+    mock_reader = MagicMock()
+    mock_reader.GetGDCMSeriesIDs.return_value = ()
+    files = resolve_dicom_series_files(dcm_dir, series_reader=mock_reader)
+    assert len(files) == 2
+    assert Path(files[0]).name == "slice_a.dcm"
+    assert Path(files[1]).name == "slice_b.dcm"
+
+    # 4. Standard GDCM series resolution
+    mock_reader_with_series = MagicMock()
+    mock_reader_with_series.GetGDCMSeriesIDs.return_value = ("1.2.3.4",)
+    mock_reader_with_series.GetGDCMSeriesFileNames.return_value = [str(slice_2), str(slice_1)]
+    resolved = resolve_dicom_series_files(dcm_dir, series_reader=mock_reader_with_series)
+    assert resolved == [str(slice_2), str(slice_1)]
+    mock_reader_with_series.GetGDCMSeriesFileNames.assert_called_once_with(str(dcm_dir), "1.2.3.4")
+
+
+def test_extract_volume_file_metadata_decoupled(tmp_path: Path) -> None:
+    """Validate standalone extract_volume_file_metadata for NIfTI and DICOM files."""
+    # 1. Missing file raises FileNotFoundError
+    with pytest.raises(FileNotFoundError, match="Volume file not found"):
+        extract_volume_file_metadata(tmp_path / "non_existent.nii.gz")
+
+    # 2. .nii.gz format: extracts clean study UID and detects CT/MRI modality heuristic
+    nii_ct = tmp_path / "patient_ct_scan_01.nii.gz"
+    nii_ct.write_bytes(b"dummy_nifti")
+    meta_ct = extract_volume_file_metadata(nii_ct)
+    assert meta_ct.study_instance_uid == "patient_ct_scan_01"
+    assert not meta_ct.study_instance_uid.endswith(".nii")
+    assert meta_ct.modality == "CT"
+
+    nii_mri = tmp_path / "brain_mri_flair.nii.gz"
+    nii_mri.write_bytes(b"dummy_mri")
+    meta_mri = extract_volume_file_metadata(nii_mri)
+    assert meta_mri.study_instance_uid == "brain_mri_flair"
+    assert meta_mri.modality == "MRI"
+
+    # Fallback modality override
+    meta_override = extract_volume_file_metadata(nii_mri, fallback_modality="CBCT")
+    assert meta_override.modality == "CBCT"
+
+    # 3. Standalone .dcm file: extracts clinical DICOM tags via pydicom
+    dcm_file = tmp_path / "standalone_slice.dcm"
+    _create_synthetic_dicom_slice(
+        path=dcm_file,
+        patient_id="PATIENT_EXTRACT_TEST",
+        study_uid="1.2.840.10008.99.1",
+        series_uid="1.2.840.10008.99.2",
+    )
+    meta_dcm = extract_volume_file_metadata(dcm_file)
+    assert meta_dcm.patient_id == "PATIENT_EXTRACT_TEST"
+    assert meta_dcm.study_instance_uid == "1.2.840.10008.99.1"
+    assert meta_dcm.series_instance_uid == "1.2.840.10008.99.2"
+
+
+def test_orient_and_populate_geometry_decoupled() -> None:
+    """Validate standalone orient_and_populate_geometry image reorientation and metadata updates."""
+    arr = np.zeros((10, 12, 14), dtype=np.float32)
+    img = sitk.GetImageFromArray(arr)
+    img.SetSpacing((1.5, 2.0, 2.5))
+    img.SetOrigin((5.0, 10.0, 15.0))
+
+    meta = VolumetricMetadata()
+    oriented_img, updated_meta = orient_and_populate_geometry(img, meta, target_orientation="LPS")
+
+    assert sitk.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(oriented_img.GetDirection()) == "LPS"
+    assert updated_meta.spatial_orientation == "LPS"
+    assert updated_meta.dimensions == oriented_img.GetSize()
+    assert updated_meta.spacing == oriented_img.GetSpacing()
+    assert updated_meta.origin == oriented_img.GetOrigin()
+    assert updated_meta.direction == oriented_img.GetDirection()
+
+    # Orientation code validation check
+    with pytest.raises(ValueError, match="Invalid 3D anatomical orientation"):
+        orient_and_populate_geometry(img, meta, target_orientation="INVALID")
+
+
+def test_dicom_volume_loader_load_polymorphic_interface(tmp_path: Path) -> None:
+    """Verify DicomVolumeLoader.load polymorphic entrypoint auto-routes to series vs file loading."""
+    loader = DicomVolumeLoader(target_orientation="RAS")
+
+    # 1. Directory routing
+    series_dir = tmp_path / "poly_series"
+    series_dir.mkdir()
+    for idx in range(3):
+        _create_synthetic_dicom_slice(
+            path=series_dir / f"slice_{idx:02d}.dcm",
+            study_uid="1.2.840.10008.88.1",
+            slice_idx=idx,
+        )
+
+    img_dir, meta_dir = loader.load(series_dir)
+    assert isinstance(img_dir, sitk.Image)
+    assert meta_dir.study_instance_uid == "1.2.840.10008.88.1"
+
+    # 2. File routing
+    arr = np.zeros((8, 8, 8), dtype=np.float32)
+    img = sitk.GetImageFromArray(arr)
+    file_path = tmp_path / "poly_vol.nii.gz"
+    sitk.WriteImage(img, str(file_path))
+
+    img_file, meta_file = loader.load(file_path)
+    assert isinstance(img_file, sitk.Image)
+    assert meta_file.study_instance_uid == "poly_vol"
+
+    # 3. Explicit is_dicom_dir flag override
+    img_override, meta_override = loader.load(series_dir, is_dicom_dir=True)
+    assert isinstance(img_override, sitk.Image)
+
+    # 4. Staticmethod aliases match helper functions
+    assert loader.resolve_series_files is resolve_dicom_series_files
+    assert loader.extract_file_metadata is extract_volume_file_metadata
+    assert loader.orient_geometry is orient_and_populate_geometry
+
 
 
 
