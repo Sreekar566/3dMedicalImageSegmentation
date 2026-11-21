@@ -268,3 +268,18 @@ def test_diagnostics_namespace_registration_bootstrap() -> None:
     finally:
         if saved is not None:
             sys.modules["medical_segmentation"] = saved
+
+
+def test_check_workspace_failure_before_probe_creation() -> None:
+    """Verify check_workspace gracefully handles write failure where probe file was never created."""
+    with patch("pathlib.Path.write_text", side_effect=PermissionError("Permission denied")):
+        res = check_workspace("/tmp/test_probe_cleanup_fail")
+        assert res["status"] == "error"
+        assert "Permission denied" in res["error"]
+
+
+def test_check_workspace_probe_unlink_skipped_when_probe_missing() -> None:
+    """Verify check_workspace cleanly completes without unlink if probe_file.exists() returns False."""
+    with patch.object(Path, "exists", return_value=False):
+        res = check_workspace("/tmp")
+        assert res["status"] == "ok"

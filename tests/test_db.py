@@ -887,3 +887,37 @@ def test_database_manager_close_and_dispose_resilience() -> None:
     # Should log warning and not raise
     db_bad.dispose()
 
+
+def test_database_manager_dispose_when_engine_none() -> None:
+    """Verify DatabaseManager.dispose() handles case when engine attribute is None or deleted."""
+    settings = DatabaseSettings()
+    db_mgr = DatabaseManager(settings=settings, engine=None)
+    db_mgr.engine = None  # type: ignore[assignment]
+    db_mgr.dispose()
+
+    del db_mgr.engine
+    db_mgr.dispose()
+
+
+def test_build_patient_study_truncated_geometry() -> None:
+    """Verify build_patient_study handles empty or truncated dimensions and spacing tuples."""
+    meta = VolumetricMetadata(
+        spacing=(),
+        dimensions=(),
+        patient_id=None,
+        study_instance_uid=None,
+        series_instance_uid=None,
+        modality=None,
+        body_part=None,
+        spatial_orientation=None,
+    )
+    study = build_patient_study(meta, timestamp=12345)
+    assert study.patient_id == "ANONYMOUS"
+    assert study.study_instance_uid == "study_12345"
+    assert study.series_instance_uid == "series_12345"
+    assert study.modality == "CT"
+    assert study.body_part == "UNKNOWN"
+    assert study.spatial_orientation == "RAS"
+    assert (study.voxel_spacing_x, study.voxel_spacing_y, study.voxel_spacing_z) == (1.0, 1.0, 1.0)
+    assert (study.dimensions_x, study.dimensions_y, study.dimensions_z) == (0, 0, 0)
+

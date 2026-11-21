@@ -2150,3 +2150,109 @@ def test_package_init_and_main_namespace_registration_bootstrap() -> None:
         if saved is not None:
             sys.modules["medical_segmentation"] = saved
 
+
+def test_extract_state_dict_non_tensor_subdict_wrapper_fallback() -> None:
+    """Verify extract_state_dict skips nested wrapper dicts that contain no torch.Tensor and continues searching."""
+    target_keys = ["layer1.weight", "layer1.bias"]
+    ckpt_payload = {
+        "state_dict": {"meta": "version_1", "info": {"foo": "bar"}},
+        "model": {
+            "layer1.weight": torch.randn(2, 2),
+            "layer1.bias": torch.randn(2),
+        },
+    }
+    cleaned = extract_state_dict(ckpt_payload, target_keys=target_keys)
+    assert set(cleaned.keys()) == set(target_keys)
+
+
+def test_load_3d_unet_empty_path_resilience() -> None:
+    """Verify load_3d_unet treats Path('') and Path('.') as None without error."""
+    net1 = load_3d_unet(checkpoint_path=Path(""))
+    assert isinstance(net1, torch.nn.Module)
+
+    net2 = load_3d_unet(checkpoint_path=Path("."))
+    assert isinstance(net2, torch.nn.Module)
+
+
+def test_orchestrator_execute_inference_engine_reuse() -> None:
+    """Verify PipelineOrchestrator reuses its existing inference_engine across multiple calls to execute_inference."""
+    orchestrator = PipelineOrchestrator()
+    vol_tensor = torch.zeros((1, 1, 8, 8, 8), dtype=torch.float32)
+
+    mask1, dur1 = orchestrator.execute_inference(vol_tensor)
+    assert orchestrator.inference_engine is not None
+    engine_ref = orchestrator.inference_engine
+
+    mask2, dur2 = orchestrator.execute_inference(vol_tensor)
+    assert orchestrator.inference_engine is engine_ref
+
+
+def test_metrics_calculator_duck_typed_metadata_and_empty_summaries() -> None:
+    """Verify VolumetricMetricsCalculator handles duck-typed metadata and None summaries/counts."""
+    calc = VolumetricMetricsCalculator()
+    raw_arr = np.ones((4, 8, 8), dtype=np.float32)
+    mask_arr = np.zeros((4, 8, 8), dtype=np.uint8)
+    mask_arr[1:3, 2:6, 2:6] = 1
+
+    class DuckTypedMeta:
+        def __init__(self) -> None:
+            self.spatial_orientation = "RAS"
+            self.spacing = (1.0, 1.0, 2.0)
+            self.dimensions = (8, 8, 4)
+            self.voxel_volume_mm3 = 2.0
+            self.pixel_area_axial_mm2 = 1.0
+
+        def continuous_index_to_physical_point(self, pt: Tuple[float, float, float]) -> Tuple[float, float, float]:
+            return (pt[0] * 1.0, pt[1] * 1.0, pt[2] * 2.0)
+
+    duck_meta = DuckTypedMeta()
+    plane = calc._resolve_slice_plane(duck_meta)  # type: ignore[arg-type]
+    assert plane == "axial"
+
+    positions = calc._compute_slice_positions(duck_meta, depth=4)  # type: ignore[arg-type]
+    assert len(positions) == 4
+    assert positions == [0.0, 2.0, 4.0, 6.0]
+
+    slice_records = list(calc.generate_slice_metrics(
+        raw_array=raw_arr,
+        mask_array=mask_arr,
+        unique_labels=[1],
+        metadata=duck_meta,  # type: ignore[arg-type]
+    ))
+    assert len(slice_records) == 2
+    assert slice_records[0]["plane"] == "axial"
+    assert slice_records[0]["cross_sectional_area_mm2"] == 16.0
+
+    with patch.object(calc, "_compute_label_summary_with_counts", return_value=(None, None)):
+        res_none = calc.compute_metrics(raw_arr, mask_arr, duck_meta, duration_seconds=1.0)  # type: ignore[arg-type]
+        assert len(res_none[0].labels) == 0
+
+    dummy_summary = LabelSummaryMetric(
+        label_id=1,
+        structure_name="Test",
+        voxel_count=32,
+        volume_mm3=64.0,
+        volume_cm3=0.064,
+        mean_intensity=1.0,
+        std_intensity=0.0,
+        min_intensity=1.0,
+        max_intensity=1.0,
+        centroid_mm=(0.0, 0.0, 0.0),
+        bounding_box=(2, 2, 1, 5, 5, 2),
+    )
+    with patch.object(calc, "_compute_label_summary_with_counts", return_value=(dummy_summary, None)):
+        res_summary_only = calc.compute_metrics(raw_arr, mask_arr, duck_meta, duration_seconds=1.0)  # type: ignore[arg-type]
+        assert len(res_summary_only[0].labels) == 1
+
+
+def test_conftest_namespace_bootstrap_already_registered() -> None:
+    """Verify conftest.py executes cleanly when 'medical_segmentation' is already in sys.modules."""
+    import runpy
+    import sys
+    assert "medical_segmentation" in sys.modules
+    conftest_path = Path(__file__).resolve().parent / "conftest.py"
+    runpy.run_path(str(conftest_path))
+    assert "medical_segmentation" in sys.modules
+
+
+

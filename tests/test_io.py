@@ -1548,3 +1548,69 @@ def test_volume_ingester_default_workspace() -> None:
     assert ingester.raw_volumes_dir == expected_workspace / "raw_volumes"
     assert ingester.raw_series_dir == expected_workspace / "raw_series"
 
+
+def test_volumetric_metadata_nonstandard_3char_orientation_fallback() -> None:
+    """Verify get_slice_plane_and_position falls through to direction matrix when 3-char code has unrecognized last char."""
+    meta = VolumetricMetadata(
+        origin=(10.0, 20.0, 30.0),
+        spacing=(1.0, 1.0, 1.0),
+        direction=(1.0, 0.0, 0.0,  0.0, 0.0, 1.0,  0.0, 1.0, 0.0),  # dominant Y (coronal)
+        spatial_orientation="XYZ",
+    )
+    plane, pos = meta.get_slice_plane_and_position(5)
+    assert plane == "coronal"
+    assert pos == 25.0
+
+
+def test_extract_pydicom_metadata_null_and_empty_extra_tags(tmp_path: Path) -> None:
+    """Verify extract_pydicom_metadata ignores extra tags that are None, empty strings, 'none', or 'null'."""
+    slice_path = _create_synthetic_dicom_slice(
+        tmp_path / "slice_null_tags.dcm",
+        patient_id="P_NULL",
+        study_uid="1.2.3",
+        series_uid="1.2.3.4",
+        window_center=None,
+        window_width=None,
+    )
+    ds = pydicom.dcmread(str(slice_path))
+    ds.SliceThickness = None
+    ds.PatientSex = "none"
+    ds.Manufacturer = ""
+    ds.PatientAge = "null"
+    ds.SeriesDescription = "   "
+    ds.StudyDescription = "Valid Study"
+    pydicom.dcmwrite(str(slice_path), ds)
+
+    meta = extract_pydicom_metadata(slice_path)
+    assert "SliceThickness" not in meta.extra_tags
+    assert "PatientSex" not in meta.extra_tags
+    assert "Manufacturer" not in meta.extra_tags
+    assert "PatientAge" not in meta.extra_tags
+    assert "SeriesDescription" not in meta.extra_tags
+    assert meta.extra_tags.get("StudyDescription") == "Valid Study"
+    assert meta.window_center is None
+    assert meta.window_width is None
+
+
+def test_mask_writer_without_direction_matrix(tmp_path: Path) -> None:
+    """Verify save_mask_as_nifti and VolumetricMaskWriter handle direction=None or empty direction tuple."""
+    mask_arr = np.zeros((4, 8, 8), dtype=np.uint8)
+    out_path = tmp_path / "no_dir_mask.nii.gz"
+
+    meta_no_dir = VolumetricMetadata(
+        origin=(0.0, 0.0, 0.0),
+        spacing=(1.0, 1.0, 1.0),
+        dimensions=(8, 8, 4),
+        direction=(),
+    )
+    res1 = save_mask_as_nifti(
+        mask_array=mask_arr,
+        reference_image=meta_no_dir,
+        output_path=out_path,
+    )
+    assert res1.is_file()
+
+    writer = VolumetricMaskWriter(default_output_dir=tmp_path)
+    res2 = writer.write_mask(mask_arr, reference=meta_no_dir, filename="writer_empty_dir.nii.gz")
+    assert res2.is_file()
+

@@ -460,3 +460,45 @@ def test_logging_config_namespace_registration_bootstrap() -> None:
         if saved is not None:
             sys.modules["medical_segmentation"] = saved
 
+
+def test_safe_json_serializer_empty_dict_fallback() -> None:
+    """Verify _safe_json_serializer falls back to str(obj) when vars(obj) contains only private attrs or is empty."""
+    class OnlyPrivateAttrs:
+        def __init__(self) -> None:
+            self._secret = "hidden"
+
+        def __str__(self) -> str:
+            return "only_private_fallback"
+
+    assert _safe_json_serializer(OnlyPrivateAttrs()) == "only_private_fallback"
+
+    class EmptyClass:
+        def __str__(self) -> str:
+            return "empty_class_fallback"
+
+    assert _safe_json_serializer(EmptyClass()) == "empty_class_fallback"
+
+    class SlottedClass:
+        __slots__ = ("val",)
+
+        def __init__(self, val: str) -> None:
+            self.val = val
+
+        def __str__(self) -> str:
+            return f"slotted_{self.val}"
+
+    assert _safe_json_serializer(SlottedClass("test")) == "slotted_test"
+
+
+def test_configure_logging_force_false_preserves_handlers() -> None:
+    """Verify configure_logging(force=False) preserves existing logger handlers."""
+    custom_logger_name = "test_force_false_logger"
+    logger = logging.getLogger(custom_logger_name)
+    dummy_handler = logging.StreamHandler()
+    logger.addHandler(dummy_handler)
+    initial_count = len(logger.handlers)
+
+    configure_logging(level="INFO", force=False, root_logger_name=custom_logger_name)
+    assert dummy_handler in logger.handlers
+    assert len(logger.handlers) > initial_count
+
