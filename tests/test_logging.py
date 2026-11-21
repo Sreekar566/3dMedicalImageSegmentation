@@ -406,3 +406,57 @@ def test_configure_logging_error_resilience(tmp_path: Path) -> None:
         )
         assert resilient_logger.name == "test_file_fail_logger"
 
+
+def test_safe_json_serializer_exception_fallbacks() -> None:
+    """Verify _safe_json_serializer falls back gracefully when item(), tolist(), or __dict__ str() raise."""
+    # 1. Custom float-like type with item() raising an exception
+    class broken_float_scalar:
+        def item(self) -> float:
+            raise RuntimeError("float item failure")
+
+        def __str__(self) -> str:
+            return "broken_float_fallback"
+
+    assert _safe_json_serializer(broken_float_scalar()) == "broken_float_fallback"
+
+    # 2. Custom ndarray-like type with size <= 20 and tolist() raising an exception
+    class broken_ndarray:
+        size = 5
+        shape = (5,)
+        dtype = np.float32
+
+        def tolist(self) -> list:
+            raise RuntimeError("tolist conversion failure")
+
+    serialized_nd = _safe_json_serializer(broken_ndarray())
+    assert "<ndarray shape=(5,) dtype=" in serialized_nd
+
+    # 3. Object with __dict__ containing an unstringable attribute
+    class UnstringableValue:
+        def __str__(self) -> str:
+            raise RuntimeError("cannot stringify value")
+
+    class ContainerWithBadAttr:
+        def __init__(self) -> None:
+            self.bad_field = UnstringableValue()
+
+        def __str__(self) -> str:
+            return "container_fallback_str"
+
+    assert _safe_json_serializer(ContainerWithBadAttr()) == "container_fallback_str"
+
+
+def test_logging_config_namespace_registration_bootstrap() -> None:
+    """Verify logging_config.py bootstraps 'medical_segmentation' into sys.modules when absent."""
+    import runpy
+    import sys
+    saved = sys.modules.pop("medical_segmentation", None)
+    try:
+        assert "medical_segmentation" not in sys.modules
+        log_path = Path(__file__).resolve().parent.parent / "logging_config.py"
+        runpy.run_path(str(log_path))
+        assert "medical_segmentation" in sys.modules
+    finally:
+        if saved is not None:
+            sys.modules["medical_segmentation"] = saved
+

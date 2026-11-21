@@ -1453,8 +1453,98 @@ def test_volumetric_metadata_direction_matrix_dominant_coronal_and_sagittal() ->
     assert plane_sag == "sagittal"
 
 
+def test_safe_parse_float_custom_and_fallback_types() -> None:
+    """Verify safe_parse_float handles Decimal, custom objects with __float__, and non-convertible types."""
+    from decimal import Decimal
+
+    # Decimal converts cleanly
+    assert safe_parse_float(Decimal("42.5")) == 42.5
+    # Non-finite Decimal falls back to default
+    assert safe_parse_float(Decimal("NaN"), 0.0) == 0.0
+    assert safe_parse_float(Decimal("Infinity"), -1.0) == -1.0
+
+    # Custom object convertible to float
+    class ConvertibleFloat:
+        def __float__(self) -> float:
+            return 99.5
+
+    assert safe_parse_float(ConvertibleFloat()) == 99.5
+
+    # Custom object where __float__ raises ValueError
+    class BadFloatVal:
+        def __float__(self) -> float:
+            raise ValueError("bad float conversion")
+
+    assert safe_parse_float(BadFloatVal(), 12.0) == 12.0
+
+    # Non-convertible generic object (raises TypeError on float())
+    class Unconvertible:
+        pass
+
+    assert safe_parse_float(Unconvertible(), 7.0) == 7.0
 
 
+def test_volumetric_metadata_truncated_spacing_and_default_geometry() -> None:
+    """Verify VolumetricMetadata handles truncated spacing tuples for voxel volume and pixel area."""
+    # spacing with < 3 elements returns 1.0 for voxel_volume_mm3
+    meta_short = VolumetricMetadata(spacing=(1.5, 2.0))
+    assert meta_short.voxel_volume_mm3 == 1.0
+
+    # spacing with < 2 elements returns 1.0 for pixel_area_slice_mm2 and pixel_area_axial_mm2
+    meta_single = VolumetricMetadata(spacing=(1.5,))
+    assert meta_single.pixel_area_slice_mm2 == 1.0
+    assert meta_single.pixel_area_axial_mm2 == 1.0
+
+    # empty spacing returns 1.0
+    meta_empty = VolumetricMetadata(spacing=())
+    assert meta_empty.voxel_volume_mm3 == 1.0
+    assert meta_empty.pixel_area_slice_mm2 == 1.0
 
 
+def test_volumetric_metadata_direction_matrix_dominant_axial_and_fallback() -> None:
+    """Verify get_slice_plane_and_position resolves axial plane via direction matrix and fallback."""
+    # Dominant axis 2 (axial) via direction matrix when spatial_orientation is empty
+    axial_meta = VolumetricMetadata(
+        origin=(10.0, 20.0, 30.0),
+        spacing=(1.0, 1.0, 1.0),
+        direction=(1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0),
+        spatial_orientation="",
+    )
+    plane_ax, pos_ax = axial_meta.get_slice_plane_and_position(3)
+    assert plane_ax == "axial"
+    assert pos_ax == 33.0
+
+    # Fallback to axial when spatial_orientation is empty and len(direction) != 9
+    fallback_meta = VolumetricMetadata(
+        origin=(10.0, 20.0, 30.0),
+        spacing=(1.0, 1.0, 1.0),
+        direction=(),
+        spatial_orientation="",
+    )
+    plane_fb, pos_fb = fallback_meta.get_slice_plane_and_position(4)
+    assert plane_fb == "axial"
+    assert pos_fb == 34.0
+
+
+def test_mask_writer_without_default_output_dir(tmp_path: Path) -> None:
+    """Verify VolumetricMaskWriter resolves filename directly when default_output_dir is None."""
+    writer = VolumetricMaskWriter(default_output_dir=None)
+    mask_arr = np.zeros((4, 8, 8), dtype=np.uint8)
+    ref_img = sitk.GetImageFromArray(np.zeros((4, 8, 8), dtype=np.float32))
+    ref_img.SetSpacing((1.0, 1.0, 1.0))
+    target_file = tmp_path / "standalone_mask.nii.gz"
+
+    saved = writer.write_mask(mask_arr, reference=ref_img, filename=str(target_file))
+    assert saved == target_file.resolve()
+    assert saved.is_file()
+
+
+def test_volume_ingester_default_workspace() -> None:
+    """Verify VolumeIngester defaults to /tmp/medical_segmentation_workspace when workspace is None."""
+    ingester = VolumeIngester(workspace=None)
+    expected_workspace = Path("/tmp/medical_segmentation_workspace").resolve()
+    assert ingester.workspace == expected_workspace
+    assert ingester.workspace.is_dir()
+    assert ingester.raw_volumes_dir == expected_workspace / "raw_volumes"
+    assert ingester.raw_series_dir == expected_workspace / "raw_series"
 

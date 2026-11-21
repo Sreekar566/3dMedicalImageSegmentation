@@ -255,3 +255,16 @@ def test_run_health_check_unhealthy_mixed_component_logging() -> None:
         assert exit_code == 1
 
 
+def test_diagnostics_namespace_registration_bootstrap() -> None:
+    """Verify diagnostics.py bootstraps 'medical_segmentation' into sys.modules when absent."""
+    import runpy
+    import sys
+    saved = sys.modules.pop("medical_segmentation", None)
+    try:
+        assert "medical_segmentation" not in sys.modules
+        diag_path = Path(__file__).resolve().parent.parent / "diagnostics.py"
+        runpy.run_path(str(diag_path))
+        assert "medical_segmentation" in sys.modules
+    finally:
+        if saved is not None:
+            sys.modules["medical_segmentation"] = saved

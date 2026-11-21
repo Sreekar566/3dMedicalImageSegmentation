@@ -2102,3 +2102,51 @@ def test_config_settings_string_parsers_and_edge_cases() -> None:
         PipelineConfig.validate_log_file(12345)
 
 
+def test_prepare_tensor_from_sitk_empty_image_validation() -> None:
+    """Verify prepare_tensor_from_sitk raises ValueError when SimpleITK image has 0 pixels."""
+    empty_img = sitk.Image(0, 0, 0, sitk.sitkFloat32)
+    with pytest.raises(ValueError, match="SimpleITK image dimensions must be strictly positive"):
+        prepare_tensor_from_sitk(image=empty_img)
+
+
+def test_main_script_entrypoint_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify executing main.py as a script (__main__) triggers main() entrypoint."""
+    import runpy
+    import sys
+    monkeypatch.setattr(sys, "argv", ["main.py", "--check-health"])
+    with patch("medical_segmentation.diagnostics.run_health_check", return_value=0) as mock_health:
+        with pytest.raises(SystemExit) as exc_info:
+            runpy.run_path(str(Path(__file__).resolve().parent.parent / "main.py"), run_name="__main__")
+        assert exc_info.value.code == 0
+        mock_health.assert_called_once()
+
+
+
+def test_package_init_and_main_namespace_registration_bootstrap() -> None:
+    """Verify __init__.py and main.py bootstrap 'medical_segmentation' into sys.modules when absent."""
+    import runpy
+    import sys
+    repo_root = Path(__file__).resolve().parent.parent
+
+    # 1. __init__.py bootstrap
+    saved = sys.modules.pop("medical_segmentation", None)
+    try:
+        assert "medical_segmentation" not in sys.modules
+        init_path = repo_root / "__init__.py"
+        runpy.run_path(str(init_path))
+        assert "medical_segmentation" in sys.modules
+    finally:
+        if saved is not None:
+            sys.modules["medical_segmentation"] = saved
+
+    # 2. main.py bootstrap without running __main__
+    saved = sys.modules.pop("medical_segmentation", None)
+    try:
+        assert "medical_segmentation" not in sys.modules
+        main_path = repo_root / "main.py"
+        runpy.run_path(str(main_path), run_name="medical_segmentation.main")
+        assert "medical_segmentation" in sys.modules
+    finally:
+        if saved is not None:
+            sys.modules["medical_segmentation"] = saved
+
