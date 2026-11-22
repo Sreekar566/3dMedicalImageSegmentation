@@ -2499,4 +2499,139 @@ def test_metrics_calculator_metadata_and_duration_validation() -> None:
         calc.compute_metrics(arr, mask, metadata=meta, duration_seconds=float("inf"))
 
 
+def test_extracted_metrics_helpers_standalone() -> None:
+    """Verify extracted standalone metrics functions and class staticmethod bindings."""
+    from medical_segmentation.pipeline.metrics import (
+        build_slice_record,
+        compute_intensity_statistics,
+        compute_label_summary,
+        compute_label_summary_with_counts,
+        compute_slice_positions,
+        compute_spatial_bounds_and_centroid,
+        generate_slice_metrics,
+        resolve_slice_plane,
+        validate_volumetric_arrays,
+    )
+
+    # 1. validate_volumetric_arrays
+    valid_raw = np.zeros((10, 10, 10), dtype=np.float32)
+    valid_mask = np.zeros((10, 10, 10), dtype=np.uint8)
+    validate_volumetric_arrays(valid_raw, valid_mask)  # Should not raise
+
+    with pytest.raises(TypeError, match="Both raw_array and mask_array must be numpy ndarrays"):
+        validate_volumetric_arrays([1, 2, 3], valid_mask)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Expected 3D volumetric arrays"):
+        validate_volumetric_arrays(np.zeros((10, 10)), valid_mask)
+    with pytest.raises(ValueError, match="Array shape mismatch"):
+        validate_volumetric_arrays(np.zeros((10, 10, 10)), np.zeros((10, 10, 5)))
+    with pytest.raises(ValueError, match="Arrays cannot be empty"):
+        validate_volumetric_arrays(np.zeros((0, 10, 10)), np.zeros((0, 10, 10)))
+
+    # 2. compute_intensity_statistics
+    raw_cube = np.arange(27, dtype=np.float32).reshape((3, 3, 3))
+    label_mask = np.zeros((3, 3, 3), dtype=bool)
+    label_mask[1, 1, 1] = True
+    mean_val, std_val, min_val, max_val = compute_intensity_statistics(raw_cube, label_mask)
+    assert mean_val == 13.0
+    assert std_val == 0.0
+    assert min_val == 13.0
+    assert max_val == 13.0
+
+    empty_mask = np.zeros((3, 3, 3), dtype=bool)
+    with pytest.raises(ValueError, match="Cannot compute intensity statistics for empty label mask"):
+        compute_intensity_statistics(raw_cube, empty_mask)
+
+    # 3. compute_spatial_bounds_and_centroid
+    meta = VolumetricMetadata(
+        spacing=(1.0, 2.0, 3.0),
+        origin=(0.0, 0.0, 0.0),
+        spatial_orientation="RAS",
+    )
+    mask_box = np.zeros((6, 6, 6), dtype=bool)
+    mask_box[1:4, 2:5, 3:6] = True  # Z=[1, 2, 3], Y=[2, 3, 4], X=[3, 4, 5]
+    bbox, centroid_mm, z_counts = compute_spatial_bounds_and_centroid(mask_box, meta, voxel_count=27)
+    assert bbox == (3, 2, 1, 5, 4, 3)  # (min_x, min_y, min_z, max_x, max_y, max_z)
+    assert np.allclose(centroid_mm, meta.continuous_index_to_physical_point((4.0, 3.0, 2.0)))
+    assert len(z_counts) == 6
+    assert z_counts[1] == 9
+
+    with pytest.raises(TypeError, match="metadata must be a VolumetricMetadata instance"):
+        compute_spatial_bounds_and_centroid(mask_box, None, voxel_count=27)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="voxel_count must be a strictly positive integer"):
+        compute_spatial_bounds_and_centroid(mask_box, meta, voxel_count=0)
+    with pytest.raises(ValueError, match="label_mask contains no active non-zero voxels"):
+        compute_spatial_bounds_and_centroid(empty_mask, meta, voxel_count=1)
+
+    # 4. resolve_slice_plane and compute_slice_positions
+    assert resolve_slice_plane(meta) == "axial"
+    positions = compute_slice_positions(meta, depth=5)
+    assert len(positions) == 5
+    assert np.isclose(positions[1] - positions[0], 3.0)
+    assert compute_slice_positions(meta, depth=0) == []
+    assert compute_slice_positions(meta, depth=-2) == []
+
+    # 5. build_slice_record
+    record = build_slice_record(
+        label_id=2,
+        slice_index=4,
+        plane="axial",
+        slice_position_mm=12.0,
+        slice_voxel_count=10,
+        pixel_area=2.5,
+        slice_intensities=np.array([10.0, 20.0, 30.0], dtype=np.float32),
+    )
+    assert record["label_id"] == 2
+    assert record["slice_index"] == 4
+    assert record["plane"] == "axial"
+    assert record["slice_position_mm"] == 12.0
+    assert record["slice_voxel_count"] == 10
+    assert record["cross_sectional_area_mm2"] == 25.0
+    assert record["mean_intensity"] == 20.0
+    assert record["max_intensity"] == 30.0
+
+    # 6. compute_label_summary and compute_label_summary_with_counts
+    summary_empty, counts_empty = compute_label_summary_with_counts(raw_cube, empty_mask, 1, meta)
+    assert summary_empty is None
+    assert counts_empty is None
+    assert compute_label_summary(raw_cube, empty_mask, 1, meta) is None
+
+    summary_active = compute_label_summary(raw_cube, label_mask, 1, meta)
+    assert summary_active is not None
+    assert summary_active.voxel_count == 1
+    assert summary_active.structure_name == "Primary_Lesion"
+
+    summary_multi = compute_label_summary(raw_cube, label_mask, 2, meta)
+    assert summary_multi is not None
+    assert summary_multi.structure_name == "Segmented_Structure_2"
+
+    # 7. generate_slice_metrics standalone generator
+    raw_vol = np.ones((5, 5, 5), dtype=np.float32) * 50.0
+    mask_vol = np.zeros((5, 5, 5), dtype=np.uint8)
+    mask_vol[2, 1:3, 1:3] = 1
+    slice_records = list(
+        generate_slice_metrics(
+            raw_array=raw_vol,
+            mask_array=mask_vol,
+            unique_labels=[1],
+            metadata=meta,
+        )
+    )
+    assert len(slice_records) == 1
+    assert slice_records[0]["slice_index"] == 2
+    assert slice_records[0]["slice_voxel_count"] == 4
+
+    # 8. VolumetricMetricsCalculator staticmethod bindings check
+    calc = VolumetricMetricsCalculator()
+    assert calc.validate_arrays is validate_volumetric_arrays
+    assert calc.compute_intensity_statistics is compute_intensity_statistics
+    assert calc.compute_spatial_bounds_and_centroid is compute_spatial_bounds_and_centroid
+    assert calc.resolve_slice_plane is resolve_slice_plane
+    assert calc.compute_slice_positions is compute_slice_positions
+    assert calc.build_slice_record is build_slice_record
+    assert calc.generate_slice_metrics is generate_slice_metrics
+    assert calc.compute_label_summary is compute_label_summary
+    assert calc.compute_label_summary_with_counts is compute_label_summary_with_counts
+
+
+
 
