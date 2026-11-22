@@ -445,7 +445,7 @@ class PipelineOrchestrator:
         local_input: Optional[Path | str] = None,
         input_container: Optional[str] = None,
         output_container: Optional[str] = None,
-        modality: str = "CT",
+        modality: Optional[str] = None,
         orientation: Optional[str] = None,
         checkpoint: Optional[Path | str] = None,
         batch_size: Optional[int] = None,
@@ -455,9 +455,10 @@ class PipelineOrchestrator:
         Execute end-to-end 3D medical segmentation workflow across all 7 stages.
         """
         total_start = time.perf_counter()
-        if not isinstance(modality, str) or modality.upper().strip() not in ("CT", "CBCT", "MRI"):
-            raise ValueError(f"Invalid modality '{modality}'. Must be one of: 'CT', 'CBCT', 'MRI'.")
-        modality_clean = modality.upper().strip()
+        raw_modality = modality if modality is not None else self.config.inference.modality
+        if not isinstance(raw_modality, str) or raw_modality.upper().strip() not in ("CT", "CBCT", "MRI"):
+            raise ValueError(f"Invalid modality '{raw_modality}'. Must be one of: 'CT', 'CBCT', 'MRI'.")
+        modality_clean = raw_modality.upper().strip()
         target_orientation = validate_orientation_code(
             orientation or self.config.inference.target_orientation
         )

@@ -79,11 +79,13 @@ class SlidingWindowInferenceEngine:
                 f"got {volume_tensor.shape[1]} channel(s)."
             )
 
+        blend_mode = getattr(self.settings, "blend_mode", "gaussian")
         logger.info(
-            "Executing 3D sliding-window inference: roi_size=%s, sw_batch_size=%d, overlap=%.2f, mode='gaussian'",
+            "Executing 3D sliding-window inference: roi_size=%s, sw_batch_size=%d, overlap=%.2f, mode=%r",
             self.settings.roi_size,
             self.settings.sw_batch_size,
             self.settings.overlap,
+            blend_mode,
         )
         self.model.eval()
         volume_tensor = volume_tensor.to(self.device)
@@ -99,7 +101,7 @@ class SlidingWindowInferenceEngine:
                     sw_batch_size=self.settings.sw_batch_size,
                     predictor=self.model,
                     overlap=self.settings.overlap,
-                    mode="gaussian",
+                    mode=blend_mode,
                     device=self.device,
                 )
 

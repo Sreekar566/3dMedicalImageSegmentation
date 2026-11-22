@@ -2255,4 +2255,248 @@ def test_conftest_namespace_bootstrap_already_registered() -> None:
     assert "medical_segmentation" in sys.modules
 
 
+def test_pipeline_config_yaml_and_toml_support(tmp_path: Path) -> None:
+    """Verify PipelineConfig multi-format configuration file loading and serialization."""
+    # 1. YAML round-trip (.yaml and .yml)
+    cfg = PipelineConfig(
+        inference=InferenceSettings(modality="MRI", roi_size=(64, 64, 64), blend_mode="constant"),
+        db=DatabaseSettings(batch_size=250, pool_recycle=900, pool_pre_ping=False),
+        log_level="DEBUG",
+    )
+    yaml_file = tmp_path / "config.yaml"
+    cfg.to_file(yaml_file)
+    assert yaml_file.is_file()
+
+    loaded_yaml = PipelineConfig.from_file(yaml_file)
+    assert loaded_yaml.inference.modality == "MRI"
+    assert loaded_yaml.inference.roi_size == (64, 64, 64)
+    assert loaded_yaml.inference.blend_mode == "constant"
+    assert loaded_yaml.db.batch_size == 250
+    assert loaded_yaml.db.pool_recycle == 900
+    assert loaded_yaml.db.pool_pre_ping is False
+    assert loaded_yaml.log_level == "DEBUG"
+
+    # Also test .yml extension
+    yml_file = tmp_path / "config.yml"
+    loaded_yaml.to_file(yml_file)
+    assert yml_file.is_file()
+    loaded_yml = PipelineConfig.from_file(yml_file)
+    assert loaded_yml.inference.modality == "MRI"
+
+    # 2. TOML file loading
+    toml_file = tmp_path / "config.toml"
+    toml_content = """
+    log_level = "WARNING"
+    log_format = "json"
+
+    [inference]
+    modality = "CBCT"
+    target_orientation = "LPS"
+    roi_size = [48, 48, 48]
+    blend_mode = "gaussian"
+
+    [db]
+    batch_size = 100
+    pool_recycle = 1200
+    pool_pre_ping = true
+    """
+    toml_file.write_text(toml_content, encoding="utf-8")
+    loaded_toml = PipelineConfig.from_file(toml_file)
+    assert loaded_toml.log_level == "WARNING"
+    assert loaded_toml.log_format == "json"
+    assert loaded_toml.inference.modality == "CBCT"
+    assert loaded_toml.inference.target_orientation == "LPS"
+    assert loaded_toml.inference.roi_size == (48, 48, 48)
+    assert loaded_toml.db.batch_size == 100
+    assert loaded_toml.db.pool_recycle == 1200
+    assert loaded_toml.db.pool_pre_ping is True
+
+    # 3. Corrupted YAML error handling
+    bad_yaml = tmp_path / "bad.yaml"
+    bad_yaml.write_text("inference: [unclosed list", encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid YAML configuration"):
+        PipelineConfig.from_file(bad_yaml)
+
+    # 4. Non-dict YAML error handling
+    list_yaml = tmp_path / "list.yaml"
+    list_yaml.write_text("- item1\n- item2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="must be an object/dictionary"):
+        PipelineConfig.from_file(list_yaml)
+
+    # 5. Corrupted TOML error handling
+    bad_toml = tmp_path / "bad.toml"
+    bad_toml.write_text("invalid_toml = [", encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid TOML configuration"):
+        PipelineConfig.from_file(bad_toml)
+
+    # 6. Non-dict TOML / empty table handling (empty TOML yields empty dict -> valid default config)
+    empty_toml = tmp_path / "empty.toml"
+    empty_toml.write_text("", encoding="utf-8")
+    empty_cfg = PipelineConfig.from_file(empty_toml)
+    assert isinstance(empty_cfg, PipelineConfig)
+
+
+def test_pipeline_config_from_dict_flat_normalization() -> None:
+    """Verify PipelineConfig.from_dict routes top-level/flat keys into nested sections."""
+    flat_data = {
+        "modality": "MRI",
+        "target_orientation": "LPS",
+        "target_spacing": [1.5, 1.5, 2.0],
+        "roi_size": [64, 64, 64],
+        "blend_mode": "constant",
+        "batch_size": 250,
+        "pool_recycle": 1500,
+        "pool_pre_ping": True,
+        "input_container": "custom-input-blob",
+        "account_name": "medimagingstore",
+        "work_dir": "/tmp/custom_work",
+        "log_level": "DEBUG",
+    }
+    cfg = PipelineConfig.from_dict(flat_data)
+    assert cfg.inference.modality == "MRI"
+    assert cfg.inference.target_orientation == "LPS"
+    assert cfg.inference.target_spacing == (1.5, 1.5, 2.0)
+    assert cfg.inference.roi_size == (64, 64, 64)
+    assert cfg.inference.blend_mode == "constant"
+    assert cfg.db.batch_size == 250
+    assert cfg.db.pool_recycle == 1500
+    assert cfg.db.pool_pre_ping is True
+    assert cfg.azure.input_container == "custom-input-blob"
+    assert cfg.azure.account_name == "medimagingstore"
+    assert cfg.work_dir == Path("/tmp/custom_work")
+    assert cfg.log_level == "DEBUG"
+
+
+def test_database_settings_pool_recycle_and_pre_ping() -> None:
+    """Verify DatabaseSettings pool_recycle and pool_pre_ping configuration and validation."""
+    db_default = DatabaseSettings()
+    assert db_default.pool_recycle == 1800
+    assert db_default.pool_pre_ping is True
+
+    custom_db = DatabaseSettings(pool_recycle=600, pool_pre_ping=False)
+    assert custom_db.pool_recycle == 600
+    assert custom_db.pool_pre_ping is False
+
+    with pytest.raises(ValidationError):
+        DatabaseSettings(pool_recycle=0)
+    with pytest.raises(ValidationError):
+        DatabaseSettings(pool_recycle=-10)
+
+    # Verify DatabaseManager configures engine with pool_recycle and pool_pre_ping
+    with patch("medical_segmentation.db.database.create_engine") as mock_create_engine:
+        DatabaseManager(settings=custom_db)
+        mock_create_engine.assert_called_once()
+        _, kwargs = mock_create_engine.call_args
+        assert kwargs.get("pool_recycle") == 600
+        assert kwargs.get("pool_pre_ping") is False
+
+
+def test_inference_settings_blend_mode_validation_and_usage() -> None:
+    """Verify InferenceSettings blend_mode validation and propagation to sliding_window_inference."""
+    inf_default = InferenceSettings()
+    assert inf_default.blend_mode == "gaussian"
+
+    inf_constant = InferenceSettings(blend_mode="constant")
+    assert inf_constant.blend_mode == "constant"
+
+    inf_normalized = InferenceSettings(blend_mode=" GAUSSIAN ")
+    assert inf_normalized.blend_mode == "gaussian"
+
+    with pytest.raises(ValidationError):
+        InferenceSettings(blend_mode="linear")
+    with pytest.raises(ValidationError):
+        InferenceSettings(blend_mode=123)  # type: ignore[arg-type]
+
+    # Verify SlidingWindowInferenceEngine uses configured blend_mode
+    model = build_3d_unet(in_channels=1, out_channels=2, channels=(4, 8), strides=(2,), num_res_units=1)
+    engine = SlidingWindowInferenceEngine(model=model, settings=inf_constant)
+    vol_tensor = torch.zeros((1, 1, 8, 8, 8))
+
+    with patch("medical_segmentation.pipeline.inference.sliding_window_inference") as mock_sw:
+        mock_sw.return_value = torch.zeros((1, 2, 8, 8, 8))
+        _ = engine.execute_inference(vol_tensor)
+        mock_sw.assert_called_once()
+        _, sw_kwargs = mock_sw.call_args
+        assert sw_kwargs.get("mode") == "constant"
+
+
+def test_main_cli_configuration_precedence_and_explicit_args(tmp_path: Path) -> None:
+    """Verify main() CLI configuration precedence when --config is supplied."""
+    cfg_file = tmp_path / "custom_precedence.json"
+    custom_cfg = PipelineConfig(
+        inference=InferenceSettings(modality="MRI", target_orientation="LPS"),
+        db=DatabaseSettings(batch_size=250),
+        log_level="DEBUG",
+    )
+    custom_cfg.to_file(cfg_file)
+
+    vol_file = tmp_path / "vol.nii.gz"
+    vol_file.touch()
+
+    # 1. Calling parse_args directly with explicit sequence
+    parsed = parse_args(["--local-input", str(vol_file), "--config", str(cfg_file)])
+    assert parsed.config == cfg_file
+    assert parsed.local_input == vol_file
+
+    # 2. main() with explicit sequence: unspecified CLI flags fall back to custom config
+    with patch("medical_segmentation.main.run_pipeline", return_value=0) as mock_run:
+        with pytest.raises(SystemExit) as exc:
+            main(["--local-input", str(vol_file), "--config", str(cfg_file)])
+        assert exc.value.code == 0
+        mock_run.assert_called_once()
+        _, kwargs = mock_run.call_args
+        assert kwargs["modality"] == "MRI"
+        assert kwargs["orientation"] == "LPS"
+        assert kwargs["batch_size"] == 250
+        assert kwargs["config"].inference.modality == "MRI"
+
+    # 3. main() with explicit sequence: explicit CLI flag overrides custom config
+    with patch("medical_segmentation.main.run_pipeline", return_value=0) as mock_run:
+        with pytest.raises(SystemExit) as exc:
+            main(["--local-input", str(vol_file), "--config", str(cfg_file), "--modality", "CBCT", "--batch-size", "150"])
+        assert exc.value.code == 0
+        mock_run.assert_called_once()
+        _, kwargs = mock_run.call_args
+        assert kwargs["modality"] == "CBCT"
+        assert kwargs["batch_size"] == 150
+        assert kwargs["orientation"] == "LPS"
+
+
+def test_mask_writer_input_validation(tmp_path: Path) -> None:
+    """Verify save_mask_as_nifti and VolumetricMaskWriter reject empty/whitespace paths."""
+    from medical_segmentation.io.mask_writer import VolumetricMaskWriter, save_mask_as_nifti
+
+    ref = sitk.Image(8, 8, 8, sitk.sitkFloat32)
+    mask = np.zeros((8, 8, 8), dtype=np.uint8)
+
+    with pytest.raises(ValueError, match="output_path must be specified"):
+        save_mask_as_nifti(mask, reference_image=ref, output_path="")
+    with pytest.raises(ValueError, match="output_path must be specified"):
+        save_mask_as_nifti(mask, reference_image=ref, output_path="   ")
+
+    writer = VolumetricMaskWriter()
+    with pytest.raises(ValueError, match="Either output_path or filename"):
+        writer.write_mask(mask, reference=ref, output_path="")
+    with pytest.raises(ValueError, match="Either output_path or filename"):
+        writer.write_mask(mask, reference=ref, filename="   ")
+
+
+def test_metrics_calculator_metadata_and_duration_validation() -> None:
+    """Verify VolumetricMetricsCalculator rejects None metadata and invalid duration_seconds."""
+    calc = VolumetricMetricsCalculator()
+    arr = np.ones((8, 8, 8), dtype=np.float32)
+    mask = np.zeros((8, 8, 8), dtype=np.uint8)
+
+    with pytest.raises(TypeError, match="metadata must be a VolumetricMetadata instance"):
+        calc.compute_metrics(arr, mask, metadata=None)  # type: ignore[arg-type]
+
+    meta = VolumetricMetadata()
+    with pytest.raises(ValueError, match="duration_seconds must be a non-negative finite number"):
+        calc.compute_metrics(arr, mask, metadata=meta, duration_seconds=-1.0)
+    with pytest.raises(ValueError, match="duration_seconds must be a non-negative finite number"):
+        calc.compute_metrics(arr, mask, metadata=meta, duration_seconds=float("nan"))
+    with pytest.raises(ValueError, match="duration_seconds must be a non-negative finite number"):
+        calc.compute_metrics(arr, mask, metadata=meta, duration_seconds=float("inf"))
+
+
 

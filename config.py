@@ -14,6 +14,16 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, Literal, Sequence, Tuple, Union
 
+try:
+    import tomllib  # Python 3.11+ standard library
+except ImportError:
+    tomllib = None  # type: ignore[assignment]
+
+try:
+    import yaml
+except ImportError:
+    yaml = None  # type: ignore[assignment]
+
 import torch
 from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -280,6 +290,15 @@ class DatabaseSettings(BaseSettings):
         ge=1,
         description="Chunk size for batched bulk inserts into PostgreSQL to avoid OOM.",
     )
+    pool_recycle: int = Field(
+        default=1800,
+        ge=1,
+        description="Recycles connections older than this number of seconds (default: 1800s / 30m) to avoid Azure idle timeouts.",
+    )
+    pool_pre_ping: bool = Field(
+        default=True,
+        description="Tests connection liveness before checkout from SQLAlchemy connection pool.",
+    )
 
     @field_validator("host", "name", "user")
     @classmethod
@@ -359,6 +378,10 @@ class InferenceSettings(BaseSettings):
         default="cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu",
         description="Execution device: 'cuda', 'mps', or 'cpu'.",
     )
+    blend_mode: Literal["gaussian", "constant"] = Field(
+        default="gaussian",
+        description="Blending mode for sliding window inference patch overlap ('gaussian' or 'constant').",
+    )
 
     @field_validator("modality", mode="before")
     @classmethod
@@ -399,6 +422,16 @@ class InferenceSettings(BaseSettings):
             torch.device(v_clean)
         except (RuntimeError, ValueError) as exc:
             raise ValueError(f"Invalid PyTorch execution device '{v}': {exc}") from exc
+        return v_clean
+
+    @field_validator("blend_mode", mode="before")
+    @classmethod
+    def normalize_blend_mode(cls, v: Any) -> str:
+        if not isinstance(v, str):
+            raise ValueError(f"blend_mode must be a string, got {type(v).__name__}.")
+        v_clean = v.lower().strip()
+        if v_clean not in ("gaussian", "constant"):
+            raise ValueError(f"Invalid blend_mode '{v}'. Must be 'gaussian' or 'constant'.")
         return v_clean
 
 
@@ -480,18 +513,19 @@ class PipelineConfig(BaseSettings):
     @classmethod
     def from_file(cls, path: Path | str) -> PipelineConfig:
         """
-        Load and validate pipeline configuration from a JSON configuration file.
+        Load and validate pipeline configuration from a JSON, YAML, or TOML configuration file.
 
         Args:
-            path: Local filesystem path to a JSON configuration file.
+            path: Local filesystem path to a configuration file (.json, .yaml, .yml, or .toml).
 
         Returns:
             Validated PipelineConfig instance.
 
         Raises:
             FileNotFoundError: If the configuration file does not exist.
-            ValueError: If the file is not valid JSON or not a JSON dictionary/object.
+            ValueError: If the file is not valid JSON/YAML/TOML or not a dictionary/object.
             TypeError: If the path parameter is not a string or Path.
+            ImportError: If parsing requires an unavailable optional library (e.g., PyYAML).
             ValidationError: If the configuration parameters fail schema validation.
         """
         if not isinstance(path, (str, Path)):
@@ -503,22 +537,55 @@ class PipelineConfig(BaseSettings):
         if not resolved_path.is_file():
             raise FileNotFoundError(f"Configuration file not found: {resolved_path}")
 
-        try:
-            with open(resolved_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSON configuration in '{resolved_path}': {exc}") from exc
+        ext = resolved_path.suffix.lower()
+        if ext in (".yaml", ".yml"):
+            if yaml is None:
+                raise ImportError(
+                    f"PyYAML is required to load YAML configuration from '{resolved_path}'. "
+                    "Install PyYAML via 'pip install pyyaml'."
+                )
+            try:
+                with open(resolved_path, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f)
+            except Exception as exc:
+                raise ValueError(f"Invalid YAML configuration in '{resolved_path}': {exc}") from exc
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"Configuration YAML in '{resolved_path}' must be an object/dictionary, got {type(data).__name__}."
+                )
+        elif ext == ".toml":
+            if tomllib is None:
+                raise ImportError(
+                    f"tomllib is required to load TOML configuration from '{resolved_path}'."
+                )
+            try:
+                with open(resolved_path, "rb") as f:
+                    data = tomllib.load(f)
+            except Exception as exc:
+                raise ValueError(f"Invalid TOML configuration in '{resolved_path}': {exc}") from exc
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"Configuration TOML in '{resolved_path}' must be an object/dictionary, got {type(data).__name__}."
+                )
+        else:
+            try:
+                with open(resolved_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON configuration in '{resolved_path}': {exc}") from exc
 
-        if not isinstance(data, dict):
-            raise ValueError(
-                f"Configuration JSON in '{resolved_path}' must be an object/dictionary, got {type(data).__name__}."
-            )
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"Configuration JSON in '{resolved_path}' must be an object/dictionary, got {type(data).__name__}."
+                )
         return cls.from_dict(data)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> PipelineConfig:
         """
         Construct and validate PipelineConfig from a dictionary payload.
+        Supports both nested sections ('azure', 'db', 'inference') and automatically
+        routes known flat configuration keys to their respective sub-models.
 
         Args:
             data: Configuration dictionary with optional nested 'azure', 'db', and 'inference' sections.
@@ -528,18 +595,79 @@ class PipelineConfig(BaseSettings):
         """
         if not isinstance(data, dict):
             raise TypeError(f"Configuration data must be a dictionary, got {type(data).__name__}.")
-        return cls.model_validate(data)
+
+        payload: Dict[str, Any] = {k: v for k, v in data.items()}
+        azure_fields = {
+            "connection_string",
+            "account_name",
+            "account_key",
+            "input_container",
+            "output_container",
+            "max_concurrency",
+            "timeout_seconds",
+        }
+        db_fields = {
+            "host",
+            "port",
+            "name",
+            "user",
+            "password",
+            "sslmode",
+            "pool_size",
+            "max_overflow",
+            "pool_timeout",
+            "batch_size",
+            "pool_recycle",
+            "pool_pre_ping",
+        }
+        inference_fields = {
+            "modality",
+            "target_orientation",
+            "target_spacing",
+            "roi_size",
+            "sw_batch_size",
+            "overlap",
+            "in_channels",
+            "out_channels",
+            "model_checkpoint_path",
+            "device",
+            "blend_mode",
+        }
+
+        # Route top-level keys into nested sections if not explicitly defined inside sections
+        azure_sec = dict(payload.get("azure", {})) if isinstance(payload.get("azure"), dict) else {}
+        db_sec = dict(payload.get("db", {})) if isinstance(payload.get("db"), dict) else {}
+        inference_sec = dict(payload.get("inference", {})) if isinstance(payload.get("inference"), dict) else {}
+
+        for k, v in list(payload.items()):
+            if k in azure_fields and k not in azure_sec:
+                azure_sec[k] = v
+            elif k in db_fields and k not in db_sec:
+                db_sec[k] = v
+            elif k in inference_fields and k not in inference_sec:
+                inference_sec[k] = v
+
+        if azure_sec:
+            payload["azure"] = azure_sec
+        if db_sec:
+            payload["db"] = db_sec
+        if inference_sec:
+            payload["inference"] = inference_sec
+
+        return cls.model_validate(payload)
 
     def to_dict(self) -> Dict[str, Any]:
         """Export strongly-typed configuration to a JSON-serializable dictionary."""
         return self.model_dump(mode="json")
 
-    def to_file(self, path: Path | str) -> Path:
+    def to_file(self, path: Path | str, format: Optional[str] = None) -> Path:
         """
-        Serialize and export configuration to a JSON file.
+        Serialize and export configuration to a JSON or YAML file.
 
         Args:
             path: Destination file path.
+            format: Optional format override ('json', 'yaml', or 'yml').
+                    Defaults to inferring from file extension or 'json'.
 
         Returns:
             Resolved Path of the saved configuration file.
@@ -551,8 +679,19 @@ class PipelineConfig(BaseSettings):
             raise ValueError("Destination file path cannot be empty.")
         resolved_path = Path(clean_path_str).resolve()
         resolved_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(resolved_path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2)
+
+        target_format = (format.lower().strip() if format else resolved_path.suffix.lower().lstrip("."))
+        if target_format in ("yaml", "yml"):
+            if yaml is None:
+                raise ImportError(
+                    f"PyYAML is required to write YAML configuration to '{resolved_path}'. "
+                    "Install PyYAML via 'pip install pyyaml'."
+                )
+            with open(resolved_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(self.to_dict(), f, sort_keys=False)
+        else:
+            with open(resolved_path, "w", encoding="utf-8") as f:
+                json.dump(self.to_dict(), f, indent=2)
         return resolved_path
 
 

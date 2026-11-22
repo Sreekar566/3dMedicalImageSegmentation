@@ -7,6 +7,7 @@ slice-by-slice voxel distribution profiles.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -328,6 +329,10 @@ class VolumetricMetricsCalculator:
             - Iterator[Dict[str, Any]]: Generator yielding 500-row chunkable slice metrics.
         """
         logger.info("Extracting quantitative volumetric metrics...")
+        if metadata is None:
+            raise TypeError("metadata must be a VolumetricMetadata instance, got None.")
+        if not isinstance(duration_seconds, (int, float)) or not math.isfinite(duration_seconds) or duration_seconds < 0.0:
+            raise ValueError(f"duration_seconds must be a non-negative finite number, got {duration_seconds}.")
         self.validate_arrays(raw_array, mask_array)
 
         unique_labels = [int(lbl) for lbl in np.unique(mask_array) if lbl != 0]

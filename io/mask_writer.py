@@ -78,10 +78,10 @@ def save_mask_as_nifti(
             f"mask_array shape {mask_array.shape} does not match reference image shape {expected_shape}."
         )
 
-    if output_path is None:
+    if output_path is None or not str(output_path).strip():
         raise ValueError("output_path must be specified.")
 
-    resolved_output = Path(output_path).resolve()
+    resolved_output = Path(str(output_path).strip()).resolve()
     resolved_output.parent.mkdir(parents=True, exist_ok=True)
 
     # Use uint16 for multi-label segmentations exceeding 255 to prevent uint8 overflow
@@ -129,12 +129,15 @@ class VolumetricMaskWriter:
         Returns:
             Resolved Path to saved NIfTI mask.
         """
-        if output_path is not None:
-            target_path = Path(output_path).resolve()
-        elif self.default_output_dir is not None and filename is not None:
-            target_path = self.default_output_dir / filename
-        elif filename is not None:
-            target_path = Path(filename).resolve()
+        clean_output = str(output_path).strip() if output_path is not None else ""
+        clean_filename = str(filename).strip() if filename is not None else ""
+
+        if clean_output:
+            target_path = Path(clean_output).resolve()
+        elif self.default_output_dir is not None and clean_filename:
+            target_path = self.default_output_dir / clean_filename
+        elif clean_filename:
+            target_path = Path(clean_filename).resolve()
         else:
             raise ValueError("Either output_path or filename (with default_output_dir) must be specified.")
 

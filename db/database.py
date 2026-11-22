@@ -242,8 +242,8 @@ class DatabaseManager:
                 pool_size=self.settings.pool_size,
                 max_overflow=self.settings.max_overflow,
                 pool_timeout=self.settings.pool_timeout,
-                pool_pre_ping=True,      # Tests connection liveness before checkout
-                pool_recycle=1800,        # Recycles connections every 30 minutes to avoid Azure idle timeouts
+                pool_pre_ping=self.settings.pool_pre_ping,      # Tests connection liveness before checkout
+                pool_recycle=self.settings.pool_recycle,        # Recycles connections older than threshold to avoid Azure idle timeouts
                 echo=False,
             )
 
