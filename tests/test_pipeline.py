@@ -2633,5 +2633,181 @@ def test_extracted_metrics_helpers_standalone() -> None:
     assert calc.compute_label_summary_with_counts is compute_label_summary_with_counts
 
 
+def test_pipeline_config_missing_dependency_and_non_dict_toml_errors(tmp_path: Path) -> None:
+    """Verify PipelineConfig error handling when PyYAML/tomllib are absent or TOML is non-dict."""
+    import medical_segmentation.config as cfg_mod
+
+    cfg = PipelineConfig()
+
+    yaml_file = tmp_path / "settings.yaml"
+    yaml_file.write_text("log_level: DEBUG\n", encoding="utf-8")
+
+    toml_file = tmp_path / "settings.toml"
+    toml_file.write_text('log_level = "DEBUG"\n', encoding="utf-8")
+
+    # 1. Missing yaml on from_file
+    with patch.object(cfg_mod, "yaml", None):
+        with pytest.raises(ImportError, match="PyYAML is required to load YAML configuration"):
+            PipelineConfig.from_file(yaml_file)
+
+    # 2. Missing yaml on to_file (via extension and via explicit format)
+    out_yaml = tmp_path / "out.yaml"
+    with patch.object(cfg_mod, "yaml", None):
+        with pytest.raises(ImportError, match="PyYAML is required to write YAML configuration"):
+            cfg.to_file(out_yaml)
+        with pytest.raises(ImportError, match="PyYAML is required to write YAML configuration"):
+            cfg.to_file(tmp_path / "out.custom", format="yaml")
+
+    # 3. Missing tomllib on from_file
+    with patch.object(cfg_mod, "tomllib", None):
+        with pytest.raises(ImportError, match="tomllib is required to load TOML configuration"):
+            PipelineConfig.from_file(toml_file)
+
+    # 4. TOML root parsed as non-dict (e.g. list or scalar)
+    with patch.object(cfg_mod.tomllib, "load", return_value=["unsupported", "list"]):
+        with pytest.raises(ValueError, match="must be an object/dictionary, got list"):
+            PipelineConfig.from_file(toml_file)
+
+
+def test_config_import_dependency_fallback_bootstrap() -> None:
+    """Verify config.py fallback handling when optional tomllib or yaml dependencies are absent."""
+    import builtins
+    import runpy
+    from typing import Any
+
+    orig_import = builtins.__import__
+
+    def mock_missing_deps_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name in ("tomllib", "yaml"):
+            raise ImportError(f"No module named '{name}'")
+        return orig_import(name, *args, **kwargs)
+
+    config_path = Path(__file__).resolve().parent.parent / "config.py"
+    builtins.__import__ = mock_missing_deps_import
+    try:
+        mod = runpy.run_path(str(config_path))
+        assert mod["tomllib"] is None
+        assert mod["yaml"] is None
+    finally:
+        builtins.__import__ = orig_import
+
+
+def test_main_run_pipeline_none_container_paths_and_logging_bypass(tmp_path: Path) -> None:
+    """Verify run_pipeline with None Azure containers and main CLI when logging configs are None."""
+    arr = np.zeros((8, 8, 8), dtype=np.float32)
+    img = sitk.GetImageFromArray(arr)
+    vol_path = tmp_path / "dummy_vol.nii.gz"
+    sitk.WriteImage(img, str(vol_path))
+
+    custom_cfg = PipelineConfig()
+    custom_cfg.azure.input_container = None  # type: ignore[assignment]
+    custom_cfg.azure.output_container = None  # type: ignore[assignment]
+
+    # 1. run_pipeline when effective input and output containers are None (skips container validation)
+    with patch("medical_segmentation.main.PipelineOrchestrator") as mock_orch_cls:
+        mock_orch = MagicMock()
+        mock_orch.__enter__.return_value = mock_orch
+        mock_orch_cls.return_value = mock_orch
+
+        exit_code = run_pipeline(
+            local_input=vol_path,
+            input_container=None,
+            output_container=None,
+            dry_run=True,
+            config=custom_cfg,
+        )
+        assert exit_code == 0
+        mock_orch.run.assert_called_once()
+        _, kwargs = mock_orch.run.call_args
+        assert kwargs["input_container"] is None
+        assert kwargs["output_container"] is None
+
+    # 2. main() when eff_log_level, eff_log_format, and eff_log_file are all None
+    with patch("medical_segmentation.main.configure_logging") as mock_conf_log:
+        with patch("medical_segmentation.main.run_health_check", return_value=0) as mock_health:
+            cfg_no_log = PipelineConfig()
+            cfg_no_log.log_level = None  # type: ignore[assignment]
+            cfg_no_log.log_format = None  # type: ignore[assignment]
+            cfg_no_log.log_file = None  # type: ignore[assignment]
+
+            with patch("medical_segmentation.main.config", cfg_no_log):
+                with pytest.raises(SystemExit) as exc:
+                    main(["--check-health"])
+                assert exc.value.code == 0
+                mock_conf_log.assert_not_called()
+                mock_health.assert_called_once()
+
+
+def test_main_cli_multi_format_config_integration(tmp_path: Path) -> None:
+    """Verify main() CLI end-to-end integration when parsing YAML and TOML config files."""
+    vol_file = tmp_path / "integration_vol.nii.gz"
+    sitk.WriteImage(sitk.GetImageFromArray(np.zeros((8, 8, 8), dtype=np.float32)), str(vol_file))
+
+    # 1. CLI with YAML config file
+    yaml_config = tmp_path / "pipeline_config.yaml"
+    yaml_config.write_text(
+        """
+log_level: DEBUG
+log_format: json
+inference:
+  modality: MRI
+  target_orientation: LPS
+  roi_size: [64, 64, 64]
+  blend_mode: constant
+db:
+  batch_size: 250
+""",
+        encoding="utf-8",
+    )
+
+    with patch("medical_segmentation.main.run_pipeline", return_value=0) as mock_run:
+        with pytest.raises(SystemExit) as exc:
+            main(["--local-input", str(vol_file), "--config", str(yaml_config), "--dry-run"])
+        assert exc.value.code == 0
+        mock_run.assert_called_once()
+        _, kwargs = mock_run.call_args
+        assert kwargs["modality"] == "MRI"
+        assert kwargs["orientation"] == "LPS"
+        assert kwargs["batch_size"] == 250
+        assert kwargs["dry_run"] is True
+        assert kwargs["config"].inference.modality == "MRI"
+        assert kwargs["config"].inference.blend_mode == "constant"
+        assert kwargs["config"].log_level == "DEBUG"
+
+    # 2. CLI with TOML config file
+    toml_config = tmp_path / "pipeline_config.toml"
+    toml_config.write_text(
+        """
+log_level = "WARNING"
+log_format = "text"
+
+[inference]
+modality = "CBCT"
+target_orientation = "RAS"
+roi_size = [32, 32, 32]
+blend_mode = "gaussian"
+
+[db]
+batch_size = 100
+""",
+        encoding="utf-8",
+    )
+
+    with patch("medical_segmentation.main.run_pipeline", return_value=0) as mock_run:
+        with pytest.raises(SystemExit) as exc:
+            main(["--local-input", str(vol_file), "--config", str(toml_config), "--dry-run"])
+        assert exc.value.code == 0
+        mock_run.assert_called_once()
+        _, kwargs = mock_run.call_args
+        assert kwargs["modality"] == "CBCT"
+        assert kwargs["orientation"] == "RAS"
+        assert kwargs["batch_size"] == 100
+        assert kwargs["dry_run"] is True
+        assert kwargs["config"].inference.modality == "CBCT"
+        assert kwargs["config"].inference.roi_size == (32, 32, 32)
+        assert kwargs["config"].log_level == "WARNING"
+
+
+
 
 
