@@ -120,31 +120,65 @@ def extract_state_dict(
             "Expected a dict or nn.Module."
         )
 
-    # Unwrap nested state dict containers if present
-    for wrapper in ("state_dict", "model_state_dict", "model", "network", "net", "weights"):
-        if wrapper in checkpoint and isinstance(checkpoint[wrapper], dict):
-            sub = checkpoint[wrapper]
-            if any(isinstance(v, torch.Tensor) for v in sub.values()):
-                checkpoint = sub
-                break
+    if not isinstance(target_keys, (list, tuple, Sequence, set)) or len(target_keys) == 0:
+        raise ValueError("target_keys must be a non-empty sequence of parameter names.")
 
     target_set = set(target_keys)
+
+    def _has_tensors(d: Any) -> bool:
+        if isinstance(d, dict):
+            return any(isinstance(v, torch.Tensor) for v in d.values()) or any(
+                _has_tensors(v) for v in d.values() if isinstance(v, dict)
+            )
+        return False
+
+    # Unwrap nested state dict containers if present (supporting multi-level nesting)
+    while isinstance(checkpoint, dict):
+        unwrapped = False
+        for wrapper in ("state_dict", "model_state_dict", "model", "network", "net", "weights"):
+            if wrapper in checkpoint and isinstance(checkpoint[wrapper], dict) and _has_tensors(checkpoint[wrapper]):
+                checkpoint = checkpoint[wrapper]
+                unwrapped = True
+                break
+        if not unwrapped:
+            break
+
     if set(checkpoint.keys()).issubset(target_set) and len(checkpoint) > 0:
-        return checkpoint
+        if all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+            return checkpoint
 
     cleaned: Dict[str, Any] = {}
+    known_prefixes = ("_orig_mod.", "module.", "network.", "net.")
+
     for k, v in checkpoint.items():
         if not isinstance(v, torch.Tensor):
             continue
         new_k = k
-        for prefix in ("module.", "_orig_mod.", "network.", "net.", "model.model."):
-            if new_k.startswith(prefix):
-                if prefix == "model.model.":
-                    new_k = new_k[len("model."):]
-                else:
+
+        # Iteratively strip compiler, distributed, and wrapper prefixes
+        while True:
+            if new_k in target_set:
+                break
+            stripped = False
+            for prefix in known_prefixes:
+                if new_k.startswith(prefix):
                     new_k = new_k[len(prefix):]
-        if new_k not in target_set and ("model." + new_k) in target_set:
-            new_k = "model." + new_k
+                    stripped = True
+                    break
+            if not stripped:
+                if new_k.startswith("model.model."):
+                    new_k = new_k[len("model."):]
+                    stripped = True
+                else:
+                    break
+
+        # Standardize 'model.' namespace prefix
+        if new_k not in target_set:
+            if ("model." + new_k) in target_set:
+                new_k = "model." + new_k
+            elif new_k.startswith("model.") and new_k[len("model."):] in target_set:
+                new_k = new_k[len("model."):]
+
         cleaned[new_k] = v
 
     return cleaned

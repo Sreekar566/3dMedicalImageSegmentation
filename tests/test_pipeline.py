@@ -205,6 +205,27 @@ def test_load_3d_unet_ddp_and_model_state_dict_variants(tmp_path: Path) -> None:
     loaded_full = load_3d_unet(checkpoint_path=full_ckpt, in_channels=1, out_channels=2)
     assert torch.allclose(next(loaded_full.parameters()), torch.full_like(next(loaded_full.parameters()), 99.5))
 
+    # 6. PyTorch 2.x compile + DDP compound prefix ('_orig_mod.module.')
+    compile_ddp_ckpt = tmp_path / "compile_ddp_weights.pt"
+    torch.save({"_orig_mod.module." + k: v for k, v in model.state_dict().items()}, str(compile_ddp_ckpt))
+    loaded_compile_ddp = load_3d_unet(checkpoint_path=compile_ddp_ckpt, in_channels=1, out_channels=2)
+    assert torch.allclose(next(loaded_compile_ddp.parameters()), torch.full_like(next(loaded_compile_ddp.parameters()), 99.5))
+
+    # 7. DDP + compile compound prefix ('module._orig_mod.')
+    ddp_compile_ckpt = tmp_path / "ddp_compile_weights.pt"
+    torch.save({"module._orig_mod." + k: v for k, v in model.state_dict().items()}, str(ddp_compile_ckpt))
+    loaded_ddp_compile = load_3d_unet(checkpoint_path=ddp_compile_ckpt, in_channels=1, out_channels=2)
+    assert torch.allclose(next(loaded_ddp_compile.parameters()), torch.full_like(next(loaded_ddp_compile.parameters()), 99.5))
+
+    # 8. Multi-level nested dictionary ('state_dict' -> 'network' -> tensors)
+    multi_nested_ckpt = tmp_path / "multi_nested.pt"
+    torch.save(
+        {"state_dict": {"network": {"_orig_mod.module." + k: v for k, v in model.state_dict().items()}}},
+        str(multi_nested_ckpt),
+    )
+    loaded_multi_nested = load_3d_unet(checkpoint_path=multi_nested_ckpt, in_channels=1, out_channels=2)
+    assert torch.allclose(next(loaded_multi_nested.parameters()), torch.full_like(next(loaded_multi_nested.parameters()), 99.5))
+
 
 def test_load_3d_unet_incompatible_checkpoint_raises_value_error(tmp_path: Path) -> None:
     """Verify that attempting to load a checkpoint with zero matching parameters raises ValueError."""
@@ -224,6 +245,12 @@ def test_extract_state_dict_helper() -> None:
     with pytest.raises(ValueError, match="Unexpected checkpoint payload type"):
         extract_state_dict("not_a_valid_checkpoint", target_keys)
 
+    # Invalid target_keys validation
+    with pytest.raises(ValueError, match="target_keys must be a non-empty sequence"):
+        extract_state_dict(dummy_model.state_dict(), [])
+    with pytest.raises(ValueError, match="target_keys must be a non-empty sequence"):
+        extract_state_dict(dummy_model.state_dict(), None)  # type: ignore[arg-type]
+
     # Bare tensor dictionary without model. prefix
     stripped_dict = {k.removeprefix("model."): v for k, v in dummy_model.state_dict().items()}
     cleaned = extract_state_dict(stripped_dict, target_keys)
@@ -233,6 +260,23 @@ def test_extract_state_dict_helper() -> None:
     metadata_dict = {"state_dict": dummy_model.state_dict(), "epoch": 5, "optimizer": {}}
     cleaned_meta = extract_state_dict(metadata_dict, target_keys)
     assert set(cleaned_meta.keys()) == set(target_keys)
+
+    # Extraneous model. prefix stripping when target model has no model. prefix
+    target_no_model = ["conv1.weight", "conv1.bias"]
+    ckpt_with_model = {
+        "model.conv1.weight": torch.randn(2, 2),
+        "model.conv1.bias": torch.randn(2),
+    }
+    cleaned_no_model = extract_state_dict(ckpt_with_model, target_no_model)
+    assert set(cleaned_no_model.keys()) == set(target_no_model)
+
+    # Chained prefixes with non-MONAI target keys
+    ckpt_chained = {
+        "_orig_mod.module.network.conv1.weight": torch.randn(2, 2),
+        "_orig_mod.module.network.conv1.bias": torch.randn(2),
+    }
+    cleaned_chained = extract_state_dict(ckpt_chained, target_no_model)
+    assert set(cleaned_chained.keys()) == set(target_no_model)
 
 
 
