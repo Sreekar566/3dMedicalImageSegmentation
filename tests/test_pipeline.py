@@ -42,7 +42,11 @@ from medical_segmentation.pipeline.inference import (
     VolumetricMetricsCalculator,
 )
 from medical_segmentation.pipeline.model import build_3d_unet, extract_state_dict, load_3d_unet
-from medical_segmentation.pipeline.transforms import build_volumetric_transforms, prepare_tensor_from_sitk
+from medical_segmentation.pipeline.transforms import (
+    build_volumetric_transforms,
+    prepare_tensor_from_sitk,
+    resample_mask_to_shape,
+)
 
 
 def test_chunked_iterable_exact_500_row_batches() -> None:
@@ -2850,6 +2854,98 @@ batch_size = 100
         assert kwargs["config"].inference.modality == "CBCT"
         assert kwargs["config"].inference.roi_size == (32, 32, 32)
         assert kwargs["config"].log_level == "WARNING"
+
+
+def test_prepare_tensor_from_sitk_anisotropic_native_and_target_spacing() -> None:
+    """Verify prepare_tensor_from_sitk honors SimpleITK native spacing and (dx, dy, dz) axis order."""
+    # Native shape in SimpleITK: size=(X=32, Y=16, Z=8), array=(Z=8, Y=16, X=32)
+    arr = np.zeros((8, 16, 32), dtype=np.float32)
+    img = sitk.GetImageFromArray(arr)
+    img.SetSpacing((0.5, 1.0, 2.0))  # dx=0.5, dy=1.0, dz=2.0
+
+    # Resample to 1mm isotropic -> Z: 8@2mm -> 15, Y: 16@1mm -> 16, X: 32@0.5mm -> 16
+    tensor_iso = prepare_tensor_from_sitk(
+        image=img,
+        modality="CT",
+        target_spacing=(1.0, 1.0, 1.0),
+        device="cpu",
+    )
+    assert type(tensor_iso) is torch.Tensor
+    assert tensor_iso.shape == (1, 1, 15, 16, 16)
+
+    # Anisotropic target spacing (dx=0.5, dy=2.0, dz=1.0) on 1mm isotropic image
+    iso_arr = np.zeros((8, 16, 16), dtype=np.float32)
+    iso_img = sitk.GetImageFromArray(iso_arr)
+    iso_img.SetSpacing((1.0, 1.0, 1.0))
+    tensor_aniso = prepare_tensor_from_sitk(
+        image=iso_img,
+        modality="MRI",
+        target_spacing=(0.5, 2.0, 1.0),
+        device="cpu",
+    )
+    # Z: 8@1mm->1mm (8), Y: 16@1mm->2mm (8), X: 16@1mm->0.5mm (31)
+    assert tensor_aniso.shape == (1, 1, 8, 8, 31)
+
+
+def test_resample_mask_to_shape_preserves_labels_and_validates_inputs() -> None:
+    """Verify resample_mask_to_shape preserves discrete uint8/uint16 labels and validates arguments."""
+    # 1. Identity shape returns exact array
+    mask_u8 = np.zeros((8, 8, 8), dtype=np.uint8)
+    mask_u8[2:6, 2:6, 2:6] = 1
+    assert resample_mask_to_shape(mask_u8, (8, 8, 8)) is mask_u8
+
+    # 2. Upsampling/downsampling preserves discrete uint16 labels > 255
+    mask_u16 = np.zeros((8, 16, 16), dtype=np.uint16)
+    mask_u16[2:6, 4:12, 4:12] = 300
+    resampled = resample_mask_to_shape(mask_u16, (16, 8, 8))
+    assert resampled.shape == (16, 8, 8)
+    assert resampled.dtype == np.uint16
+    assert set(np.unique(resampled)).issubset({0, 300})
+    assert 300 in resampled
+
+    # 3. Validation errors
+    with pytest.raises(TypeError, match="mask_array must be a numpy ndarray"):
+        resample_mask_to_shape([[[1]]], (4, 4, 4))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="mask_array must be 3-dimensional"):
+        resample_mask_to_shape(np.zeros((4, 4), dtype=np.uint8), (4, 4, 4))
+    with pytest.raises(ValueError, match="target_shape must be 3 strictly positive integers"):
+        resample_mask_to_shape(mask_u8, (4, 0, 4))
+    with pytest.raises(ValueError, match="target_shape must be 3 strictly positive integers"):
+        resample_mask_to_shape(mask_u8, (4, 4))  # type: ignore[arg-type]
+
+
+def test_pipeline_orchestrator_resampling_end_to_end_dry_run(tmp_path: Path) -> None:
+    """Verify PipelineOrchestrator completes end-to-end when target_spacing resamples the input volume."""
+    # Native volume shape (Z=16, Y=24, X=24) with non-unit spacing (dx=1.5, dy=1.5, dz=2.0)
+    arr = np.random.uniform(low=-200.0, high=400.0, size=(16, 24, 24)).astype(np.float32)
+    img = sitk.GetImageFromArray(arr)
+    img.SetSpacing((1.5, 1.5, 2.0))
+    img.SetOrigin((10.0, 20.0, 30.0))
+
+    volume_path = tmp_path / "anisotropic_scan.nii.gz"
+    sitk.WriteImage(img, str(volume_path))
+
+    workspace_dir = tmp_path / "workspace_resample"
+    cfg = PipelineConfig(work_dir=workspace_dir)
+    cfg.inference.roi_size = (32, 32, 32)
+    cfg.inference.target_spacing = (1.0, 1.0, 1.0)
+    cfg.inference.device = "cpu"
+
+    orchestrator = PipelineOrchestrator(config=cfg, workspace=workspace_dir)
+    result = orchestrator.run(
+        local_input=volume_path,
+        modality="CT",
+        dry_run=True,
+    )
+
+    assert isinstance(result, PipelineResult)
+    # Output mask must match the native (Z, Y, X) shape and physical NIfTI reference geometry
+    assert result.mask_array.shape == (16, 24, 24)
+    assert result.local_mask_path.is_file()
+    saved_mask = sitk.ReadImage(str(result.local_mask_path))
+    assert saved_mask.GetSize() == (24, 24, 16)
+    assert np.allclose(saved_mask.GetSpacing(), (1.5, 1.5, 2.0))
+
 
 
 

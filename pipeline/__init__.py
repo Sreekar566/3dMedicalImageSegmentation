@@ -3,7 +3,11 @@ Pipeline Package for 3dMedicalImageSegmentation.
 Contains MONAI volumetric transforms, 3D U-Net model loaders, sliding-window inference engines, and volumetric metric extractors.
 """
 
-from .transforms import build_volumetric_transforms, prepare_tensor_from_sitk
+from .transforms import (
+    build_volumetric_transforms,
+    prepare_tensor_from_sitk,
+    resample_mask_to_shape,
+)
 from .model import build_3d_unet, extract_state_dict, load_3d_unet
 from .inference import SlidingWindowInferenceEngine
 from .metrics import (
@@ -25,6 +29,7 @@ from .orchestrator import PipelineOrchestrator, PipelineResult
 __all__ = [
     "build_volumetric_transforms",
     "prepare_tensor_from_sitk",
+    "resample_mask_to_shape",
     "build_3d_unet",
     "extract_state_dict",
     "load_3d_unet",

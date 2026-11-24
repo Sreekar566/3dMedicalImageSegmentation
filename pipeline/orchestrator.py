@@ -34,7 +34,10 @@ from medical_segmentation.pipeline.metrics import (
     VolumetricMetricsCalculator,
 )
 from medical_segmentation.pipeline.model import load_3d_unet
-from medical_segmentation.pipeline.transforms import prepare_tensor_from_sitk
+from medical_segmentation.pipeline.transforms import (
+    prepare_tensor_from_sitk,
+    resample_mask_to_shape,
+)
 
 if TYPE_CHECKING:
     from medical_segmentation.db.database import DatabaseManager
@@ -494,6 +497,13 @@ class PipelineOrchestrator:
             checkpoint=checkpoint,
         )
         raw_array = sitk_to_numpy(sitk_image)
+        if mask_array.shape != raw_array.shape:
+            logger.info(
+                "Resampling predicted mask from %s back to native volume shape %s.",
+                mask_array.shape,
+                raw_array.shape,
+            )
+            mask_array = resample_mask_to_shape(mask_array, target_shape=raw_array.shape)
 
         logger.info("=== Step 5: Quantitative Metric Extraction ===")
         summary_metrics, slice_generator = self.extract_metrics(
