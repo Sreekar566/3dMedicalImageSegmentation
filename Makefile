@@ -1,4 +1,4 @@
-.PHONY: help install test lint coverage healthcheck docker-build docker-up docker-down docker-logs clean
+.PHONY: help install test lint coverage healthcheck healthcheck-db healthcheck-azure healthcheck-all docker-build docker-up docker-down docker-logs clean
 
 help:  ## Show this help message
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -18,6 +18,15 @@ coverage:  ## Run pytest test suite with code coverage reporting
 
 healthcheck:  ## Run local system and dependency health check
 	python -m main --check-health
+
+healthcheck-db:  ## Run health check including PostgreSQL database
+	python -m main --check-health --check-db
+
+healthcheck-azure:  ## Run health check including Azure Blob Storage
+	python -m main --check-health --check-azure
+
+healthcheck-all:  ## Run complete health check across all runtime dependencies and external services
+	python -m main --check-health --check-all
 
 docker-build:  ## Build segmentation pipeline Docker image
 	docker build -t medseg-pipeline:latest .

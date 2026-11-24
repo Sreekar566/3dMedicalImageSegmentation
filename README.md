@@ -212,6 +212,18 @@ To additionally verify PostgreSQL database connectivity and responsiveness:
 python -m main --check-health --check-db
 ```
 
+To verify Azure Blob Storage connectivity, credentials, and container accessibility:
+
+```bash
+python -m main --check-health --check-azure
+```
+
+To execute a comprehensive diagnostic health check verifying all runtime components, PostgreSQL, and Azure Blob Storage:
+
+```bash
+python -m main --check-health --check-all
+```
+
 ### Structured JSON Logging & File Persistence
 
 Run health checks or pipeline execution with structured JSON logs formatted for automated ingestion by cloud aggregators (Azure Monitor, CloudWatch, Datadog):
@@ -267,8 +279,11 @@ make install       # Install pinned requirements
 make test          # Execute pytest test suite
 make lint          # Run code verification and syntax compilation checks
 make coverage      # Run pytest test suite with code coverage reporting
-make healthcheck   # Run system diagnostics probe
-make docker-up     # Launch PostgreSQL and pipeline via compose
+make healthcheck         # Run system diagnostics probe
+make healthcheck-db      # Run health check including PostgreSQL database
+make healthcheck-azure   # Run health check including Azure Blob Storage
+make healthcheck-all     # Run comprehensive health check with DB and Azure
+make docker-up           # Launch PostgreSQL and pipeline via compose
 make docker-down   # Tear down compose services and networks
 make clean         # Remove python bytecode and test caches
 ```

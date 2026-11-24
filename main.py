@@ -28,6 +28,7 @@ from medical_segmentation.config import (
 )
 default_config = config
 from medical_segmentation.diagnostics import (
+    check_azure,
     check_system_health as _diagnostics_check_system_health,
     run_health_check as _diagnostics_run_health_check,
 )
@@ -43,6 +44,7 @@ from medical_segmentation.pipeline import PipelineOrchestrator, PipelineResult
 __all__ = [
     "StandardTextFormatter",
     "StructuredJsonFormatter",
+    "check_azure",
     "check_system_health",
     "configure_logging",
     "get_logger",
@@ -98,6 +100,16 @@ def parse_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--check-db",
         action="store_true",
         help="Include PostgreSQL database connection verification during health check.",
+    )
+    parser.add_argument(
+        "--check-azure",
+        action="store_true",
+        help="Include Azure Blob Storage connection verification during health check.",
+    )
+    parser.add_argument(
+        "--check-all",
+        action="store_true",
+        help="Include all external services (PostgreSQL and Azure Blob Storage) during health check.",
     )
 
     parser.add_argument(
@@ -237,6 +249,8 @@ def run_pipeline(
 
 def check_system_health(
     check_db: bool = False,
+    check_azure: bool = False,
+    verify_azure_containers: bool = False,
     config: Optional[PipelineConfig] = None,
 ) -> Dict[str, Any]:
     """
@@ -246,12 +260,20 @@ def check_system_health(
     Returns:
         Dictionary detailing component statuses and overall health flag ('status': 'healthy' | 'unhealthy').
     """
-    return _diagnostics_check_system_health(check_db=check_db, config=config)
+    return _diagnostics_check_system_health(
+        check_db=check_db,
+        check_azure=check_azure,
+        verify_azure_containers=verify_azure_containers,
+        config=config,
+    )
 
 
 def run_health_check(
     check_db: bool = False,
+    check_azure: bool = False,
+    verify_azure_containers: bool = False,
     config: Optional[PipelineConfig] = None,
+    health_checker: Optional[Callable[..., Dict[str, Any]]] = None,
 ) -> int:
     """
     CLI/probe wrapper for check_system_health.
@@ -260,8 +282,10 @@ def run_health_check(
     """
     return _diagnostics_run_health_check(
         check_db=check_db,
+        check_azure=check_azure,
+        verify_azure_containers=verify_azure_containers,
         config=config,
-        health_checker=check_system_health,
+        health_checker=health_checker or check_system_health,
     )
 
 
@@ -302,10 +326,17 @@ def main(args: Optional[Sequence[str]] = None) -> None:
         )
 
     if getattr(parsed_args, "check_health", None) is True:
-        check_db = getattr(parsed_args, "check_db", None) is True
+        check_all_services = getattr(parsed_args, "check_all", None) is True
+        check_db = check_all_services or getattr(parsed_args, "check_db", None) is True
+        check_azure = check_all_services or getattr(parsed_args, "check_azure", None) is True
+
+        kwargs: Dict[str, Any] = {"check_db": check_db}
+        if check_azure:
+            kwargs["check_azure"] = True
         if has_custom_config:
-            sys.exit(run_health_check(check_db=check_db, config=active_config))
-        sys.exit(run_health_check(check_db=check_db))
+            kwargs["config"] = active_config
+
+        sys.exit(run_health_check(**kwargs))
 
     if has_custom_config:
         input_container = parsed_args.container if "--container" in explicit_flags else active_config.azure.input_container

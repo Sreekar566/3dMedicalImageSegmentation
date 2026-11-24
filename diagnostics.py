@@ -19,12 +19,13 @@ if "medical_segmentation" not in sys.modules:
     med_pkg.__path__ = [str(Path(__file__).resolve().parent)]
     sys.modules["medical_segmentation"] = med_pkg
 
-from medical_segmentation.config import DatabaseSettings, PipelineConfig
+from medical_segmentation.config import AzureStorageSettings, DatabaseSettings, PipelineConfig
 
 logger = logging.getLogger("3dMedicalImageSegmentation.diagnostics")
 
 __all__ = [
     "SystemHealthChecker",
+    "check_azure",
     "check_database",
     "check_monai",
     "check_python",
@@ -155,13 +156,100 @@ def check_database(settings: Optional[DatabaseSettings] = None) -> Dict[str, Any
             db_mgr.dispose()
 
 
+def check_azure(
+    settings: Optional[AzureStorageSettings] = None,
+    verify_containers: bool = False,
+) -> Dict[str, Any]:
+    """
+    Verify Azure Blob Storage connectivity, credentials, and optional container accessibility.
+
+    Args:
+        settings: Optional AzureStorageSettings instance.
+        verify_containers: If True, also checks that input and output containers exist.
+
+    Returns:
+        Dictionary detailing probe status ('ok' or 'error') and metadata.
+    """
+    try:
+        from medical_segmentation.config import AzureStorageSettings as DefaultAzureSettings
+        from medical_segmentation.io.azure_client import AzureBlobClient
+
+        azure_settings = settings or DefaultAzureSettings()
+        azure_client = AzureBlobClient(settings=azure_settings)
+
+        if not azure_client.is_connected:
+            return {
+                "status": "error",
+                "error": "No Azure Storage credentials configured (AZURE_STORAGE_CONNECTION_STRING or AZURE_STORAGE_ACCOUNT_NAME/KEY required).",
+            }
+
+        client = azure_client._client
+        if client is None:
+            return {
+                "status": "error",
+                "error": "Failed to initialize Azure BlobServiceClient.",
+            }
+
+        account_info = client.get_account_information()
+        account_kind = (
+            account_info.get("account_kind")
+            if isinstance(account_info, dict)
+            else getattr(account_info, "account_kind", None)
+        )
+        sku_name = (
+            account_info.get("sku_name")
+            if isinstance(account_info, dict)
+            else getattr(account_info, "sku_name", None)
+        )
+
+        details: Dict[str, Any] = {
+            "status": "ok",
+            "account_name": azure_settings.account_name or "connection_string",
+            "account_kind": account_kind,
+            "sku_name": sku_name,
+            "input_container": azure_settings.input_container,
+            "output_container": azure_settings.output_container,
+        }
+
+        if verify_containers:
+            container_status: Dict[str, bool] = {}
+            missing_containers = []
+            for c_name in (azure_settings.input_container, azure_settings.output_container):
+                if c_name:
+                    c_client = client.get_container_client(c_name)
+                    exists = bool(c_client.exists())
+                    container_status[c_name] = exists
+                    if not exists:
+                        missing_containers.append(c_name)
+
+            details["containers"] = container_status
+            if missing_containers:
+                return {
+                    "status": "error",
+                    "error": f"Azure container(s) not found or inaccessible: {', '.join(missing_containers)}",
+                    "containers": container_status,
+                }
+
+        return details
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+        }
+
+
 class SystemHealthChecker:
     """Orchestrates diagnostic health probes across subsystems."""
 
     def __init__(self, config: Optional[PipelineConfig] = None):
         self.config = config
 
-    def check_all(self, check_db: bool = False) -> Dict[str, Any]:
+    def check_all(
+        self,
+        check_db: bool = False,
+        check_azure: bool = False,
+        verify_azure_containers: bool = False,
+    ) -> Dict[str, Any]:
         """Execute all subsystem probes and aggregate overall health status."""
         from medical_segmentation.config import config as default_config
 
@@ -192,6 +280,14 @@ class SystemHealthChecker:
         if check_db:
             results["components"]["database"] = check_database(active_config.db)
 
+        # 7. Azure Blob Storage (optional or requested)
+        if check_azure:
+            azure_probe_fn = globals()["check_azure"]
+            results["components"]["azure"] = azure_probe_fn(
+                active_config.azure,
+                verify_containers=verify_azure_containers,
+            )
+
         # Determine overall system health
         for comp_data in results["components"].values():
             if comp_data.get("status") != "ok":
@@ -203,21 +299,29 @@ class SystemHealthChecker:
 
 def check_system_health(
     check_db: bool = False,
+    check_azure: bool = False,
+    verify_azure_containers: bool = False,
     config: Optional[PipelineConfig] = None,
 ) -> Dict[str, Any]:
     """
     Perform diagnostic health checks across runtime dependencies and storage.
-    Verifies Python, PyTorch, SimpleITK, MONAI, workspace storage, and optionally PostgreSQL.
+    Verifies Python, PyTorch, SimpleITK, MONAI, workspace storage, and optionally PostgreSQL and Azure Blob Storage.
 
     Returns:
         Dictionary detailing component statuses and overall health flag ('status': 'healthy' | 'unhealthy').
     """
     checker = SystemHealthChecker(config=config)
-    return checker.check_all(check_db=check_db)
+    return checker.check_all(
+        check_db=check_db,
+        check_azure=check_azure,
+        verify_azure_containers=verify_azure_containers,
+    )
 
 
 def run_health_check(
     check_db: bool = False,
+    check_azure: bool = False,
+    verify_azure_containers: bool = False,
     config: Optional[PipelineConfig] = None,
     health_checker: Optional[Callable[..., Dict[str, Any]]] = None,
 ) -> int:
@@ -227,15 +331,29 @@ def run_health_check(
 
     Args:
         check_db: Whether to include PostgreSQL database verification.
+        check_azure: Whether to include Azure Blob Storage verification.
+        verify_azure_containers: Whether to verify input/output container existence during Azure check.
         config: Optional PipelineConfig instance.
         health_checker: Optional callable overriding check_system_health (useful for dependency injection and mocking).
 
     Returns:
         Exit code: 0 on healthy, 1 on unhealthy.
     """
-    logger.info("Executing pipeline system health check (check_db=%s)...", check_db)
+    logger.info(
+        "Executing pipeline system health check (check_db=%s, check_azure=%s)...",
+        check_db,
+        check_azure,
+    )
     checker_fn = health_checker or check_system_health
-    results = checker_fn(check_db=check_db, config=config)
+    try:
+        results = checker_fn(
+            check_db=check_db,
+            check_azure=check_azure,
+            verify_azure_containers=verify_azure_containers,
+            config=config,
+        )
+    except TypeError:
+        results = checker_fn(check_db=check_db, config=config)
     status = results.get("status", "unknown")
     if status == "healthy":
         logger.info("[HEALTH] System status: HEALTHY. All checked components operational.")

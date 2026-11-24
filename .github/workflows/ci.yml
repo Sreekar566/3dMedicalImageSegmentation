@@ -51,9 +51,10 @@ jobs:
         run: |
           python -m main --check-health --log-format json
 
-      - name: Run test suite
+      - name: Run test suite with coverage
         run: |
-          pytest -v --tb=short
+          coverage run -m pytest -v --tb=short
+          coverage report -m --fail-under=95
 
   docker-validate:
     name: Validate Docker & Compose Config
