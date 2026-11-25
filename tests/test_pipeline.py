@@ -2947,7 +2947,31 @@ def test_pipeline_orchestrator_resampling_end_to_end_dry_run(tmp_path: Path) -> 
     assert np.allclose(saved_mask.GetSpacing(), (1.5, 1.5, 2.0))
 
 
+def test_pipeline_config_type_hints_and_dynamic_section_routing() -> None:
+    """Verify PipelineConfig.to_file type hints resolve and from_dict prioritizes nested over flat keys."""
+    import typing
 
+    hints = typing.get_type_hints(PipelineConfig.to_file)
+    assert "format" in hints
+    assert hints["return"] is Path
 
+    assert PipelineConfig.validate_log_file(Path("   ")) is None
+    assert PipelineConfig.validate_log_file(Path(".")) is None
+
+    cfg = PipelineConfig.from_dict(
+        {
+            "modality": "MRI",
+            "overlap": 0.25,
+            "inference": {"modality": "CBCT"},
+            "pool_timeout": 45,
+            "db": {"batch_size": 128},
+            "max_concurrency": 8,
+        }
+    )
+    assert cfg.inference.modality == "CBCT"
+    assert cfg.inference.overlap == 0.25
+    assert cfg.db.pool_timeout == 45
+    assert cfg.db.batch_size == 128
+    assert cfg.azure.max_concurrency == 8
 
 
