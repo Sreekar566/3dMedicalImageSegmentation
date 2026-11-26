@@ -36,15 +36,36 @@ __all__ = [
     "DatabaseSettings",
     "InferenceSettings",
     "PipelineConfig",
+    "VALID_MODALITIES",
     "config",
     "parse_model_checkpoint_path",
     "parse_roi_size",
     "parse_target_spacing",
     "validate_azure_container_name",
+    "validate_modality",
     "validate_orientation_code",
 ]
 
 AZURE_CONTAINER_NAME_REGEX = re.compile(r"^[a-z0-9](?!.*--)[a-z0-9-]{1,61}[a-z0-9]$")
+VALID_MODALITIES: Tuple[str, ...] = ("CT", "CBCT", "MRI")
+
+
+def validate_modality(modality: Any) -> str:
+    """
+    Validate and normalize imaging modality against supported volumetric protocols.
+
+    Args:
+        modality: Imaging modality string (e.g., 'CT', 'CBCT', or 'MRI').
+
+    Returns:
+        Normalized uppercase modality string.
+
+    Raises:
+        ValueError: If modality is not a supported string value.
+    """
+    if not isinstance(modality, str) or modality.upper().strip() not in VALID_MODALITIES:
+        raise ValueError(f"Invalid modality '{modality}'. Must be one of: 'CT', 'CBCT', 'MRI'.")
+    return modality.upper().strip()
 
 
 def validate_orientation_code(v: str) -> str:

@@ -2975,3 +2975,60 @@ def test_pipeline_config_type_hints_and_dynamic_section_routing() -> None:
     assert cfg.azure.max_concurrency == 8
 
 
+def test_validate_modality_and_main_cli_helpers(tmp_path: Path) -> None:
+    """Verify validate_modality and extracted main.py CLI resolution helpers."""
+    from medical_segmentation.config import validate_modality
+    from medical_segmentation.main import (
+        _build_health_check_kwargs,
+        _build_pipeline_kwargs,
+        _extract_explicit_flags,
+        _resolve_cli_option,
+        _resolve_pipeline_run_params,
+    )
+
+    assert validate_modality("  mri ") == "MRI"
+    assert validate_modality("ct") == "CT"
+    assert validate_modality("CbCt") == "CBCT"
+    with pytest.raises(ValueError, match="Invalid modality 'PET'"):
+        validate_modality("PET")
+    with pytest.raises(ValueError, match="Invalid modality '123'"):
+        validate_modality(123)  # type: ignore[arg-type]
+
+    flags = _extract_explicit_flags(["--local-input", "vol.nii.gz", "--modality=MRI", "--dry-run"])
+    assert flags == {"--local-input", "--modality", "--dry-run"}
+
+    custom_cfg = PipelineConfig(
+        inference=InferenceSettings(modality="MRI", target_orientation="LPS"),
+        db=DatabaseSettings(batch_size=128),
+    )
+    parsed = parse_args(["--local-input", str(tmp_path / "v.nii.gz"), "--modality", "CBCT"])
+    assert _resolve_cli_option(parsed, "modality", "--modality", {"--modality"}, "MRI", True) == "CBCT"
+    assert _resolve_cli_option(parsed, "orientation", "--orientation", {"--modality"}, "LPS", True) == "LPS"
+
+    pipe_kwargs = _build_pipeline_kwargs(parsed, {"--modality"}, custom_cfg, has_custom_config=True)
+    assert pipe_kwargs["modality"] == "CBCT"
+    assert pipe_kwargs["orientation"] == "LPS"
+    assert pipe_kwargs["batch_size"] == 128
+    assert pipe_kwargs["config"] is custom_cfg
+
+    health_parsed = parse_args(["--check-health", "--check-all"])
+    health_kwargs = _build_health_check_kwargs(health_parsed, custom_cfg, has_custom_config=True)
+    assert health_kwargs == {"check_db": True, "check_azure": True, "config": custom_cfg}
+
+    resolved_params = _resolve_pipeline_run_params(
+        custom_cfg,
+        blob_path="study/vol.nii.gz",
+        series_prefix=None,
+        local_input=None,
+        input_container=None,
+        output_container=None,
+        modality=" ct ",
+        orientation=None,
+        checkpoint=None,
+        batch_size=None,
+    )
+    assert resolved_params["modality"] == "CT"
+    assert resolved_params["orientation"] == "LPS"
+    assert resolved_params["batch_size"] == 128
+
+

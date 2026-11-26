@@ -7,12 +7,10 @@ quantitative metric extraction, and 500-row chunked batched PostgreSQL ingestion
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
-import time
 import types
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
 
 # Ensure 'medical_segmentation' module namespace is resolvable
 if "medical_segmentation" not in sys.modules:
@@ -24,6 +22,7 @@ from medical_segmentation.config import (
     PipelineConfig,
     config,
     validate_azure_container_name,
+    validate_modality,
     validate_orientation_code,
 )
 default_config = config
@@ -177,6 +176,76 @@ def parse_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(args)
 
 
+_PIPELINE_OPTION_SPECS: Tuple[Tuple[str, str, str, Callable[[PipelineConfig], Any]], ...] = (
+    ("input_container", "container", "--container", lambda c: c.azure.input_container),
+    ("output_container", "output_container", "--output-container", lambda c: c.azure.output_container),
+    ("modality", "modality", "--modality", lambda c: c.inference.modality),
+    ("orientation", "orientation", "--orientation", lambda c: c.inference.target_orientation),
+    ("checkpoint", "checkpoint", "--checkpoint", lambda c: c.inference.model_checkpoint_path),
+    ("batch_size", "batch_size", "--batch-size", lambda c: c.db.batch_size),
+)
+
+
+def _resolve_pipeline_run_params(
+    active_config: PipelineConfig,
+    *,
+    blob_path: Optional[str],
+    series_prefix: Optional[str],
+    local_input: Optional[Path | str],
+    input_container: Optional[str],
+    output_container: Optional[str],
+    modality: Optional[str],
+    orientation: Optional[str],
+    checkpoint: Optional[Path | str],
+    batch_size: Optional[int],
+) -> Dict[str, Any]:
+    """Validate and resolve effective pipeline execution parameters against active configuration."""
+    eff_batch_size = active_config.db.batch_size if batch_size is None else batch_size
+    if eff_batch_size <= 0:
+        raise ValueError(f"batch_size must be a strictly positive integer, got {eff_batch_size}.")
+
+    eff_orientation = validate_orientation_code(
+        orientation if orientation is not None else active_config.inference.target_orientation
+    )
+    eff_modality = validate_modality(
+        modality if modality is not None else active_config.inference.modality
+    )
+
+    eff_in_container = (
+        input_container if input_container is not None else active_config.azure.input_container
+    )
+    if eff_in_container is not None:
+        validate_azure_container_name(eff_in_container)
+
+    eff_out_container = (
+        output_container if output_container is not None else active_config.azure.output_container
+    )
+    if eff_out_container is not None:
+        validate_azure_container_name(eff_out_container)
+
+    eff_checkpoint = (
+        checkpoint if checkpoint is not None else active_config.inference.model_checkpoint_path
+    )
+
+    clean_blob, clean_prefix, clean_local = validate_input_sources(
+        blob_path=blob_path,
+        series_prefix=series_prefix,
+        local_input=local_input,
+    )
+
+    return {
+        "blob_path": clean_blob,
+        "series_prefix": clean_prefix,
+        "local_input": clean_local,
+        "input_container": eff_in_container,
+        "output_container": eff_out_container,
+        "modality": eff_modality,
+        "orientation": eff_orientation,
+        "checkpoint": eff_checkpoint,
+        "batch_size": eff_batch_size,
+    }
+
+
 def run_pipeline(
     blob_path: Optional[str] = None,
     series_prefix: Optional[str] = None,
@@ -198,47 +267,22 @@ def run_pipeline(
     """
     try:
         active_config = config or default_config
-
-        eff_batch_size = active_config.db.batch_size if batch_size is None else batch_size
-        if eff_batch_size <= 0:
-            raise ValueError(f"batch_size must be a strictly positive integer, got {eff_batch_size}.")
-
-        eff_orientation = validate_orientation_code(
-            orientation if orientation is not None else active_config.inference.target_orientation
-        )
-
-        raw_modality = modality if modality is not None else active_config.inference.modality
-        if not isinstance(raw_modality, str) or raw_modality.upper().strip() not in ("CT", "CBCT", "MRI"):
-            raise ValueError(f"Invalid modality '{raw_modality}'. Must be one of: 'CT', 'CBCT', 'MRI'.")
-        eff_modality = raw_modality.upper().strip()
-
-        eff_in_container = input_container if input_container is not None else active_config.azure.input_container
-        if eff_in_container is not None:
-            validate_azure_container_name(eff_in_container)
-
-        eff_out_container = output_container if output_container is not None else active_config.azure.output_container
-        if eff_out_container is not None:
-            validate_azure_container_name(eff_out_container)
-
-        eff_checkpoint = checkpoint if checkpoint is not None else active_config.inference.model_checkpoint_path
-
-        clean_blob, clean_prefix, clean_local = validate_input_sources(
+        run_params = _resolve_pipeline_run_params(
+            active_config,
             blob_path=blob_path,
             series_prefix=series_prefix,
             local_input=local_input,
+            input_container=input_container,
+            output_container=output_container,
+            modality=modality,
+            orientation=orientation,
+            checkpoint=checkpoint,
+            batch_size=batch_size,
         )
 
         with PipelineOrchestrator(config=active_config) as orchestrator:
             orchestrator.run(
-                blob_path=clean_blob,
-                series_prefix=clean_prefix,
-                local_input=clean_local,
-                input_container=eff_in_container,
-                output_container=eff_out_container,
-                modality=eff_modality,
-                orientation=eff_orientation,
-                checkpoint=eff_checkpoint,
-                batch_size=eff_batch_size,
+                **run_params,
                 dry_run=dry_run,
             )
         return 0
@@ -289,34 +333,57 @@ def run_health_check(
     )
 
 
-def main(args: Optional[Sequence[str]] = None) -> None:
-    """CLI entrypoint."""
-    parsed_args = parse_args(args)
-    config_file = getattr(parsed_args, "config", None)
-    active_config = config
-    has_custom_config = False
-    if isinstance(config_file, (str, Path)):
-        active_config = PipelineConfig.from_file(config_file)
-        has_custom_config = True
-
+def _extract_explicit_flags(args: Optional[Sequence[str]]) -> Set[str]:
+    """Extract long CLI option flags explicitly supplied by the caller."""
     raw_cli_args = sys.argv[1:] if args is None else list(args)
-    explicit_flags = {
-        arg.split("=")[0]
-        for arg in raw_cli_args
-        if arg.startswith("--")
-    }
+    return {arg.split("=")[0] for arg in raw_cli_args if arg.startswith("--")}
 
-    log_level = getattr(parsed_args, "log_level", None)
-    log_format = getattr(parsed_args, "log_format", None)
-    log_file = getattr(parsed_args, "log_file", None)
+
+def _load_cli_config(parsed_args: argparse.Namespace) -> Tuple[PipelineConfig, bool]:
+    """Load custom PipelineConfig from --config if provided, otherwise fall back to global config."""
+    config_file = getattr(parsed_args, "config", None)
+    if isinstance(config_file, (str, Path)):
+        return PipelineConfig.from_file(config_file), True
+    return config, False
+
+
+def _resolve_cli_option(
+    parsed_args: argparse.Namespace,
+    attr: str,
+    flag: str,
+    explicit_flags: Set[str],
+    config_value: Any,
+    has_custom_config: bool,
+    expected_types: Optional[Tuple[type, ...]] = None,
+) -> Any:
+    """Resolve an effective CLI option, giving explicit flags precedence over loaded config values."""
     if has_custom_config:
-        eff_log_level = parsed_args.log_level if "--log-level" in explicit_flags else active_config.log_level
-        eff_log_format = parsed_args.log_format if "--log-format" in explicit_flags else active_config.log_format
-        eff_log_file = parsed_args.log_file if "--log-file" in explicit_flags else active_config.log_file
-    else:
-        eff_log_level = log_level if isinstance(log_level, str) else active_config.log_level
-        eff_log_format = log_format if isinstance(log_format, str) else active_config.log_format
-        eff_log_file = log_file if isinstance(log_file, (str, Path)) else active_config.log_file
+        return getattr(parsed_args, attr) if flag in explicit_flags else config_value
+    arg_val = getattr(parsed_args, attr, None)
+    if expected_types is not None:
+        return arg_val if isinstance(arg_val, expected_types) else config_value
+    return arg_val
+
+
+def _configure_cli_logging(
+    parsed_args: argparse.Namespace,
+    explicit_flags: Set[str],
+    active_config: PipelineConfig,
+    has_custom_config: bool,
+) -> None:
+    """Reconfigure application logging when effective logging settings are present."""
+    eff_log_level = _resolve_cli_option(
+        parsed_args, "log_level", "--log-level", explicit_flags,
+        active_config.log_level, has_custom_config, expected_types=(str,),
+    )
+    eff_log_format = _resolve_cli_option(
+        parsed_args, "log_format", "--log-format", explicit_flags,
+        active_config.log_format, has_custom_config, expected_types=(str,),
+    )
+    eff_log_file = _resolve_cli_option(
+        parsed_args, "log_file", "--log-file", explicit_flags,
+        active_config.log_file, has_custom_config, expected_types=(str, Path),
+    )
 
     if isinstance(eff_log_level, str) or isinstance(eff_log_format, str) or isinstance(eff_log_file, (str, Path)):
         configure_logging(
@@ -325,49 +392,68 @@ def main(args: Optional[Sequence[str]] = None) -> None:
             log_file=eff_log_file,
         )
 
-    if getattr(parsed_args, "check_health", None) is True:
-        check_all_services = getattr(parsed_args, "check_all", None) is True
-        check_db = check_all_services or getattr(parsed_args, "check_db", None) is True
-        check_azure = check_all_services or getattr(parsed_args, "check_azure", None) is True
 
-        kwargs: Dict[str, Any] = {"check_db": check_db}
-        if check_azure:
-            kwargs["check_azure"] = True
-        if has_custom_config:
-            kwargs["config"] = active_config
+def _build_health_check_kwargs(
+    parsed_args: argparse.Namespace,
+    active_config: PipelineConfig,
+    has_custom_config: bool,
+) -> Dict[str, Any]:
+    """Build keyword arguments for run_health_check from CLI arguments."""
+    check_all_services = getattr(parsed_args, "check_all", None) is True
+    check_db = check_all_services or getattr(parsed_args, "check_db", None) is True
+    check_azure_flag = check_all_services or getattr(parsed_args, "check_azure", None) is True
 
-        sys.exit(run_health_check(**kwargs))
-
+    kwargs: Dict[str, Any] = {"check_db": check_db}
+    if check_azure_flag:
+        kwargs["check_azure"] = True
     if has_custom_config:
-        input_container = parsed_args.container if "--container" in explicit_flags else active_config.azure.input_container
-        output_container = parsed_args.output_container if "--output-container" in explicit_flags else active_config.azure.output_container
-        modality = parsed_args.modality if "--modality" in explicit_flags else active_config.inference.modality
-        orientation = parsed_args.orientation if "--orientation" in explicit_flags else active_config.inference.target_orientation
-        checkpoint = parsed_args.checkpoint if "--checkpoint" in explicit_flags else active_config.inference.model_checkpoint_path
-        batch_size = parsed_args.batch_size if "--batch-size" in explicit_flags else active_config.db.batch_size
-    else:
-        input_container = parsed_args.container
-        output_container = parsed_args.output_container
-        modality = parsed_args.modality
-        orientation = parsed_args.orientation
-        checkpoint = parsed_args.checkpoint
-        batch_size = parsed_args.batch_size
+        kwargs["config"] = active_config
+    return kwargs
 
+
+def _build_pipeline_kwargs(
+    parsed_args: argparse.Namespace,
+    explicit_flags: Set[str],
+    active_config: PipelineConfig,
+    has_custom_config: bool,
+) -> Dict[str, Any]:
+    """Assemble run_pipeline keyword arguments honoring CLI flag precedence over config files."""
     kwargs: Dict[str, Any] = {
         "blob_path": parsed_args.blob_path,
         "series_prefix": parsed_args.series_prefix,
         "local_input": parsed_args.local_input,
-        "input_container": input_container,
-        "output_container": output_container,
-        "modality": modality,
-        "orientation": orientation,
-        "checkpoint": checkpoint,
-        "batch_size": batch_size,
-        "dry_run": parsed_args.dry_run,
     }
+    for kwarg_name, arg_attr, cli_flag, config_getter in _PIPELINE_OPTION_SPECS:
+        kwargs[kwarg_name] = _resolve_cli_option(
+            parsed_args=parsed_args,
+            attr=arg_attr,
+            flag=cli_flag,
+            explicit_flags=explicit_flags,
+            config_value=config_getter(active_config),
+            has_custom_config=has_custom_config,
+        )
+    kwargs["dry_run"] = parsed_args.dry_run
     if has_custom_config:
         kwargs["config"] = active_config
-    sys.exit(run_pipeline(**kwargs))
+    return kwargs
+
+
+def main(args: Optional[Sequence[str]] = None) -> None:
+    """CLI entrypoint."""
+    parsed_args = parse_args(args)
+    active_config, has_custom_config = _load_cli_config(parsed_args)
+    explicit_flags = _extract_explicit_flags(args)
+
+    _configure_cli_logging(parsed_args, explicit_flags, active_config, has_custom_config)
+
+    if getattr(parsed_args, "check_health", None) is True:
+        health_kwargs = _build_health_check_kwargs(parsed_args, active_config, has_custom_config)
+        sys.exit(run_health_check(**health_kwargs))
+
+    pipeline_kwargs = _build_pipeline_kwargs(
+        parsed_args, explicit_flags, active_config, has_custom_config
+    )
+    sys.exit(run_pipeline(**pipeline_kwargs))
 
 
 if __name__ == "__main__":

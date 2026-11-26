@@ -22,6 +22,7 @@ from medical_segmentation.config import (
     PipelineConfig,
     config as default_config,
     validate_azure_container_name,
+    validate_modality,
     validate_orientation_code,
 )
 from medical_segmentation.io.azure_client import AzureBlobClient
@@ -184,9 +185,7 @@ class PipelineOrchestrator:
         """
         Step 2: Load volume and standardize spatial orientation via sitk.DICOMOrient.
         """
-        if not isinstance(modality, str) or modality.upper().strip() not in ("CT", "CBCT", "MRI"):
-            raise ValueError(f"Invalid modality '{modality}'. Must be one of: 'CT', 'CBCT', 'MRI'.")
-        modality_clean = modality.upper().strip()
+        modality_clean = validate_modality(modality)
 
         target_orientation = validate_orientation_code(
             orientation or self.config.inference.target_orientation
@@ -459,9 +458,7 @@ class PipelineOrchestrator:
         """
         total_start = time.perf_counter()
         raw_modality = modality if modality is not None else self.config.inference.modality
-        if not isinstance(raw_modality, str) or raw_modality.upper().strip() not in ("CT", "CBCT", "MRI"):
-            raise ValueError(f"Invalid modality '{raw_modality}'. Must be one of: 'CT', 'CBCT', 'MRI'.")
-        modality_clean = raw_modality.upper().strip()
+        modality_clean = validate_modality(raw_modality)
         target_orientation = validate_orientation_code(
             orientation or self.config.inference.target_orientation
         )
